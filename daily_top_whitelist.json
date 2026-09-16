@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-09-16 20:43:35 IST",
+  "source": "Kaggle NVIDIA T4 GPU Calibration Pipeline",
+  "universe_size": 115,
+  "top_longs": [
+    "BHEL",
+    "CYIENT",
+    "KPITTECH",
+    "AARTIIND",
+    "ASHOKLEY",
+    "SONATSOFTW",
+    "DIXON",
+    "COFORGE",
+    "SUZLON",
+    "AUROPHARMA"
+  ],
+  "top_shorts": [
+    "PAYTM",
+    "YESBANK",
+    "RPOWER",
+    "DHANI",
+    "DELTACORP"
+  ],
+  "sector_cap": 2,
+  "mean_ic": 0.0876,
+  "status": "ACTIVE"
+}
