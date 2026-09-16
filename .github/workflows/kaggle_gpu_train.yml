@@ -37,71 +37,7 @@ jobs:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
-          python -c '
-          import os, json, sys, requests
-
-          raw_token = os.environ.get("KAGGLE_API_TOKEN", "").strip()
-          user = os.environ.get("KAGGLE_USERNAME", "").strip() or "akashcc"
-          key = ""
-
-          print(f"[DIAG] raw_token length: {len(raw_token)}")
-          print(f"[DIAG] starts with brace: {raw_token.startswith("{")}")
-          print(f"[DIAG] contains colon: {":" in raw_token}")
-
-          if raw_token.startswith("{"):
-              try:
-                  data = json.loads(raw_token)
-                  user = data.get("username", user)
-                  key = data.get("key", "")
-              except Exception as e:
-                  print("[WARN] Failed to parse JSON token:", e)
-
-          if not key:
-              if ":" in raw_token:
-                  parts = raw_token.split(":", 1)
-                  user = parts[0].strip()
-                  key = parts[1].strip()
-              else:
-                  key = raw_token
-
-          print(f"[DIAG] Resolved username: {user}")
-          print(f"[DIAG] Resolved key length: {len(key)}")
-
-          candidate_users = [user, "Akashcc702", "akashcc702", "akashcc", "akashccakashcc10"]
-          candidate_users = list(dict.fromkeys(candidate_users))
-
-          success_user = None
-          for u in candidate_users:
-              url = "https://www.kaggle.com/api/v1/datasets/list?page=1"
-              resp = requests.get(url, auth=(u, key))
-              print(f"[AUTH TEST] user=\"{u}\" -> HTTP {resp.status_code} | body: {resp.text[:120]}")
-              if resp.status_code == 200:
-                  success_user = u
-                  break
-
-          if success_user:
-              user = success_user
-              print(f"SUCCESS! Valid Kaggle credentials verified for user: {user}")
-          else:
-              print("WARNING: None of candidate usernames succeeded with this key.")
-
-          kaggle_dir = os.path.expanduser("~/.kaggle")
-          os.makedirs(kaggle_dir, exist_ok=True)
-          creds_file = os.path.join(kaggle_dir, "kaggle.json")
-          with open(creds_file, "w") as f:
-              json.dump({"username": user, "key": key}, f)
-          os.chmod(creds_file, 0o600)
-
-          # Update kernel-metadata.json id to use the verified user
-          meta_path = "kaggle_kernel/kernel-metadata.json"
-          if os.path.exists(meta_path):
-              with open(meta_path, "r") as mf:
-                  mdata = json.load(mf)
-              mdata["id"] = f"{user}/qlib-alpha-gpu-trainer"
-              with open(meta_path, "w") as mf:
-                  json.dump(mdata, mf, indent=2)
-              print(f"Updated kernel-metadata.json id to: {mdata["id"]}")
-          '
+          python setup_kaggle.py
 
       - name: Push Kernel to Kaggle GPU Cloud
         run: |
@@ -231,12 +167,12 @@ jobs:
               mean_ic, ic_ir, hardware = 0.084, 2.45, "NVIDIA Tesla T4"
 
           msg = (
-              f"🚀 <b>KAGGLE GPU RETRAINING DEPLOYED!</b>\n\n"
-              f"⚡ <b>Hardware:</b> {hardware} (16GB VRAM)\n"
-              f"🎯 <b>Mean Factor IC:</b> +{mean_ic:.4f}\n"
-              f"📊 <b>Factor IC-IR:</b> +{ic_ir:.2f}\n"
-              f"🛡️ <b>Universe:</b> 113 Stocks (30 Alphas Orthogonalized)\n"
-              f"☁️ <b>Deployment:</b> Azure Intraday VM (104.211.100.195)\n\n"
+              f"🚀 <b>KAGGLE GPU RETRAINING DEPLOYED!</b>\\n\\n"
+              f"⚡ <b>Hardware:</b> {hardware} (16GB VRAM)\\n"
+              f"🎯 <b>Mean Factor IC:</b> +{mean_ic:.4f}\\n"
+              f"📊 <b>Factor IC-IR:</b> +{ic_ir:.2f}\\n"
+              f"🛡️ <b>Universe:</b> 113 Stocks (30 Alphas Orthogonalized)\\n"
+              f"☁️ <b>Deployment:</b> Azure Intraday VM (104.211.100.195)\\n\\n"
               f"<i>✅ Live trading engine reloaded with fresh weights!</i>"
           )
 
