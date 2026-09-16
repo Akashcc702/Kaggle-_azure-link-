@@ -5,46 +5,107 @@ import re
 import requests
 
 raw_token = os.environ.get("KAGGLE_API_TOKEN", "").strip()
-print(f"[TOKEN ANALYSIS] Length: {len(raw_token)}")
-print(f"[TOKEN ANALYSIS] Leading ords: {[ord(c) for c in raw_token[:6]]}")
-print(f"[TOKEN ANALYSIS] Trailing ords: {[ord(c) for c in raw_token[-6:]]}")
+akashcc_val = os.environ.get("AKASHCC", "").strip()
+user_env = os.environ.get("KAGGLE_USERNAME", "").strip()
 
-# Look for 32-char hex key
-hex_match = re.search(r"[a-f0-9]{32}", raw_token, re.IGNORECASE)
-if hex_match:
-    key = hex_match.group(0).lower()
-else:
-    key = raw_token.strip()
+print(f"[RESOLVER] KAGGLE_API_TOKEN len: {len(raw_token)}")
+print(f"[RESOLVER] AKASHCC secret len: {len(akashcc_val)}")
+print(f"[RESOLVER] KAGGLE_USERNAME len: {len(user_env)}")
 
-user = "akashcc"
-print(f"[TESTING] user={user}, key_len={len(key)}")
+# Collect possible keys
+candidate_keys = []
+candidate_users = ["akashcc", "Akashcc", "akashcc702", "Akashcc702"]
 
-# 1. Test official datasets/list with mine=true
-url_mine = "https://www.kaggle.com/api/v1/datasets/list?mine=true"
-r_mine = requests.get(url_mine, auth=(user, key))
-print(f"[MINE TEST] HTTP {r_mine.status_code} | {r_mine.text[:100]}")
+for val in [akashcc_val, raw_token]:
+    if not val:
+        continue
+    # Check if JSON
+    if "{" in val and "}" in val:
+        try:
+            d = json.loads(val[val.find("{"):val.rfind("}")+1])
+            if "username" in d:
+                candidate_users.insert(0, d["username"])
+            if "key" in d:
+                candidate_keys.insert(0, d["key"])
+        except Exception as e:
+            print("[WARN] JSON parse error:", e)
+    
+    # Check 32-hex match
+    hex_match = re.search(r"[a-f0-9]{32}", val, re.IGNORECASE)
+    if hex_match:
+        candidate_keys.append(hex_match.group(0).lower())
+    
+    # Raw value without quotes
+    cleaned = val.strip("\"' \t\r\n")
+    if cleaned and cleaned not in candidate_keys:
+        candidate_keys.append(cleaned)
+    
+    # If val looks like a username (e.g. alphanumeric < 25 chars without hex)
+    if len(cleaned) < 25 and re.match(r"^[a-zA-Z0-9_]+$", cleaned) and not hex_match:
+        candidate_users.insert(0, cleaned)
 
-# 2. Test kernels/list with mine=true
-url_kernels = "https://www.kaggle.com/api/v1/kernels/list?mine=true"
-r_kernels = requests.get(url_kernels, auth=(user, key))
-print(f"[KERNELS TEST] HTTP {r_kernels.status_code} | {r_kernels.text[:100]}")
+# Dedup
+candidate_keys = list(dict.fromkeys(candidate_keys))
+candidate_users = list(dict.fromkeys(candidate_users))
 
-# 3. Test whoami or profile
-url_user = "https://www.kaggle.com/api/v1/users/akashcc"
-r_user = requests.get(url_user, auth=(user, key))
-print(f"[USER TEST] HTTP {r_user.status_code} | {r_user.text[:100]}")
+print(f"[RESOLVER] Candidate users: {candidate_users}")
+print(f"[RESOLVER] Found {len(candidate_keys)} candidate key(s) with lengths: {[len(k) for k in candidate_keys]}")
 
-# Write credentials to ~/.kaggle/kaggle.json
+# Test kernel push payload
+with open("kaggle_kernel/train_alpha_gpu.py", "r", encoding="utf-8") as f:
+    code_text = f.read()
+
+payload = {
+    "slug": "qlib-alpha-gpu-trainer",
+    "newTitle": "Qlib Alpha GPU Trainer",
+    "text": code_text,
+    "language": "python",
+    "kernelType": "script",
+    "isPrivate": True,
+    "enableGpu": True,
+    "enableInternet": True
+}
+
+verified_user = None
+verified_key = None
+
+for u in candidate_users:
+    for k in candidate_keys:
+        # Test push endpoint directly
+        push_url = "https://www.kaggle.com/api/v1/kernels/push"
+        r = requests.post(push_url, auth=(u, k), json=payload)
+        print(f"[TEST] user='{u}', key_len={len(k)} -> HTTP {r.status_code} | {r.text[:100]}")
+        if r.status_code in [200, 201]:
+            verified_user = u
+            verified_key = k
+            print(f"🎉 SUCCESS! Verified working credentials for user '{u}'!")
+            break
+        elif "has not accepted" in r.text or "terms" in r.text.lower():
+            verified_user = u
+            verified_key = k
+            print(f"[INFO] Auth passed, but terms needed: {r.text}")
+            break
+    if verified_user:
+        break
+
+if not verified_user:
+    # Fallback to best guess
+    verified_user = candidate_users[0] if candidate_users else "akashcc"
+    verified_key = candidate_keys[0] if candidate_keys else raw_token
+    print(f"[WARN] No combination returned 200, using best guess: user='{verified_user}', key_len={len(verified_key)}")
+
+# Write to ~/.kaggle/kaggle.json
 kaggle_dir = os.path.expanduser("~/.kaggle")
 os.makedirs(kaggle_dir, exist_ok=True)
 with open(os.path.join(kaggle_dir, "kaggle.json"), "w") as f:
-    json.dump({"username": user, "key": key}, f)
+    json.dump({"username": verified_user, "key": verified_key}, f)
 os.chmod(os.path.join(kaggle_dir, "kaggle.json"), 0o600)
 
 meta_path = "kaggle_kernel/kernel-metadata.json"
 if os.path.exists(meta_path):
     with open(meta_path, "r") as mf:
         mdata = json.load(mf)
-    mdata["id"] = f"{user}/qlib-alpha-gpu-trainer"
+    mdata["id"] = f"{verified_user}/qlib-alpha-gpu-trainer"
     with open(meta_path, "w") as mf:
         json.dump(mdata, mf, indent=2)
+    print(f"Updated kernel-metadata.json id to: {mdata['id']}")
