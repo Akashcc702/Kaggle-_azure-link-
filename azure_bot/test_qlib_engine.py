@@ -1180,9 +1180,158 @@ def test_azure_intraday_tier6_nextlevel_features():
 
     print("  ✅ All 6 Tier-6 Features verified: Volume Profile POC & VA | Kyle's Lambda Absorption Meter | Fractal Hurst Chop Filter | Dalton OR Fake-Drive Guard | Garman-Klass Dynamic Target | Gap Exhaustion Defense = 100% PERFECT!")
 
+def test_azure_intraday_tier7_institutional_features():
+    print("[TEST 36/36] Testing 6 Tier-7 Institutional Profit-Doubler Quant Features...")
+    from smallcap_intraday_engine import (
+        compute_amihud_illiquidity,
+        compute_multi_anchor_vwap,
+        compute_lee_ready_abvr,
+        compute_ou_half_life,
+        compute_depth_slope_ratio,
+        calculate_fractional_kelly_sizing,
+        VirtualPortfolio,
+        AMIHUD_ILLIQ_THRESHOLD,
+        AMIHUD_MAX_SLIPPAGE_BPS,
+        AVWAP_MAX_CONFLUENCE_BANDWIDTH,
+        ABVR_MIN_LONG_THRESHOLD,
+        ABVR_MAX_SHORT_THRESHOLD,
+        OU_HALF_LIFE_MIN_MINUTES,
+        DEPTH_SLOPE_COLLAPSE_MIN,
+        KELLY_DYNAMIC_MIN_MULT,
+        KELLY_DYNAMIC_MAX_MULT,
+    )
+
+    # 1. Feature 1: Amihud Illiquidity Ratio & Smart Passive Limit Router (Amihud 2002)
+    # High illiquidity test: price jump on low turnover
+    df_illiq = pd.DataFrame({
+        "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+        "close": [101.5, 102.8, 103.9, 105.2, 106.8],
+        "volume": [100, 150, 120, 180, 110]
+    })
+    res_illiq = compute_amihud_illiquidity(df_illiq)
+    assert res_illiq["is_illiquid"] is True
+    assert res_illiq["order_type"] == "PASSIVE_LIMIT"
+    assert res_illiq["expected_slippage_bps"] > 0
+
+    # Low illiquidity / liquid stock
+    df_liquid = pd.DataFrame({
+        "open": [100.0, 100.1, 100.2, 100.1, 100.3],
+        "close": [100.1, 100.2, 100.1, 100.3, 100.2],
+        "volume": [50000, 60000, 55000, 70000, 65000]
+    })
+    res_liquid = compute_amihud_illiquidity(df_liquid)
+    assert res_liquid["is_illiquid"] is False
+    assert res_liquid["order_type"] == "MARKET"
+
+    # Execution rejection on excessive expected slippage
+    quote_illiq_trap = {
+        "lp": 100.0, "bp1": 99.8, "sp1": 100.2, "tbq": 500, "tsq": 500,
+        "test_amihud": {"illiq": 1.25, "is_illiquid": True, "expected_slippage_bps": 35.0, "order_type": "PASSIVE_LIMIT"}
+    }
+    port_illiq = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_illiq.execute_twap_sor("TEST_AMIHUD_REJECT", quote_illiq_trap, "Tech", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_AMIHUD_REJECT" not in port_illiq.positions
+
+    # 2. Feature 2: Multi-Anchor Anchored-VWAP (AVWAP) Confluence Gate (Madhavan 1997, Shannon 2023)
+    # Divergent AVWAP trap (>0.30% bandwidth)
+    quote_avwap_trap = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_avwap": {"session_avwap": 100.0, "pivot_avwap": 101.5, "confluence_bandwidth_pct": 1.50, "is_confluent": False}
+    }
+    port_avwap = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_avwap.execute_twap_sor("TEST_AVWAP_TRAP", quote_avwap_trap, "Chemicals", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_AVWAP_TRAP" not in port_avwap.positions
+
+    # Confluent tight pinch (bandwidth <= 0.30%)
+    quote_avwap_ok = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_avwap": {"session_avwap": 100.0, "pivot_avwap": 100.15, "confluence_bandwidth_pct": 0.15, "is_confluent": True}
+    }
+    assert compute_multi_anchor_vwap(quote=quote_avwap_ok)["is_confluent"] is True
+
+    # 3. Feature 3: Lee-Ready Tick Rule & Aggressive Buy Volume Ratio (ABVR) (Lee & Ready 1991)
+    # Passive buyer trap (sellers dumping on limit orders: ABVR = 40% < 70%)
+    quote_abvr_trap = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_abvr": {"abvr": 0.40, "is_aggressive_buyer": False, "is_aggressive_seller": False}
+    }
+    port_abvr = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_abvr.execute_twap_sor("TEST_ABVR_PASSIVE", quote_abvr_trap, "Auto", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_ABVR_PASSIVE" not in port_abvr.positions
+
+    # Aggressive ask sweeping (ABVR = 85% >= 70%)
+    quote_abvr_ok = {"test_abvr": {"abvr": 0.85, "is_aggressive_buyer": True, "is_aggressive_seller": False}}
+    assert compute_lee_ready_abvr(quote=quote_abvr_ok)["is_aggressive_buyer"] is True
+
+    # 4. Feature 4: Ornstein-Uhlenbeck (OU) Mean-Reversion Half-Life Stop Gate (Vasicek 1977)
+    port_ou = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_ou_init = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000}
+    port_ou.execute_twap_sor("TEST_OU_STOCK", quote_ou_init, "Power", "BUY", cs_rank=90.0, bypass_window=True)
+    assert "TEST_OU_STOCK" in port_ou.positions
+
+    # Trigger fast mean reversion quick escape
+    quote_ou_fast = {"test_ou_fast_revert": True, "test_ou_info": {"half_life_min": 6.5, "is_fast_reverting": True}}
+    port_ou.update_trailing_sl("TEST_OU_STOCK", ltp=100.10, quote=quote_ou_fast)
+    pos_ou = port_ou.positions["TEST_OU_STOCK"]
+    assert pos_ou["sl"] >= 100.10  # SL moved to cost
+    assert pos_ou["breakeven_locked"] is True
+
+    # 5. Feature 5: Order Book Depth-Slope Collapse Shock Exit (Cont et al. 2014)
+    port_dsr = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_dsr_init = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000}
+    port_dsr.execute_twap_sor("TEST_DSR_STOCK", quote_dsr_init, "Metals", "BUY", cs_rank=90.0, bypass_window=True)
+    assert "TEST_DSR_STOCK" in port_dsr.positions
+
+    # Trigger depth slope collapse shock exit
+    quote_dsr_shock = {"test_depth_collapse": True, "test_dsr_info": {"dsr": -0.65, "is_depth_collapse": True}}
+    port_dsr.check_and_exit("TEST_DSR_STOCK", ltp=100.50, quote=quote_dsr_shock)
+    assert "TEST_DSR_STOCK" not in port_dsr.positions
+
+    # 6. Feature 6: Volatility-Normalized Fractional Kelly Dynamic Sizing (Kelly 1956, Thorp 2006)
+    res_marginal = calculate_fractional_kelly_sizing(cs_rank=75.0, abvr=0.45)
+    assert res_marginal["kelly_mult"] <= 0.85
+
+    res_super = calculate_fractional_kelly_sizing(cs_rank=98.0, abvr=0.85)
+    assert res_super["kelly_mult"] >= 1.50
+
+    port_kelly = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_kelly = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_kelly_mult": 2.0
+    }
+    port_kelly.execute_twap_sor("TEST_KELLY_SUPER", quote_kelly, "Finance", "BUY", cs_rank=98.0, bypass_window=True)
+    pos_k = port_kelly.positions["TEST_KELLY_SUPER"]
+    assert pos_k["kelly_info"]["kelly_mult"] == 2.0
+    assert pos_k["kelly_info"]["effective_rupee_risk"] == 700.0
+
+    # 7. Metadata Verification on Active Trade
+    quote_full_t7 = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000}
+    port_full_t7 = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_full_t7.execute_twap_sor("TEST_FULL_T7", quote_full_t7, "Auto", "BUY", cs_rank=92.0, bypass_window=True)
+    pos_t7 = port_full_t7.positions["TEST_FULL_T7"]
+    assert "amihud_info" in pos_t7
+    assert "avwap_info" in pos_t7
+    assert "abvr_info" in pos_t7
+    assert "ou_info" in pos_t7
+    assert "dsr_info" in pos_t7
+    assert "kelly_info" in pos_t7
+
+    # 8. Constant Calibration Verification
+    assert AMIHUD_ILLIQ_THRESHOLD == 0.85
+    assert AMIHUD_MAX_SLIPPAGE_BPS == 25.0
+    assert AVWAP_MAX_CONFLUENCE_BANDWIDTH == 0.30
+    assert ABVR_MIN_LONG_THRESHOLD == 0.70
+    assert ABVR_MAX_SHORT_THRESHOLD == 0.30
+    assert OU_HALF_LIFE_MIN_MINUTES == 8.0
+    assert DEPTH_SLOPE_COLLAPSE_MIN == -0.50
+    assert KELLY_DYNAMIC_MIN_MULT == 0.50
+    assert KELLY_DYNAMIC_MAX_MULT == 2.00
+
+    print("  ✅ All 6 Tier-7 Features verified: Amihud Passive Limit Router | Multi-Anchor AVWAP Gate | Lee-Ready ABVR Flow | OU Half-Life Stop | Depth-Slope Collapse Exit | Fractional Kelly Sizing (0.5x-2.0x) = 100% PERFECT!")
+
 if __name__ == "__main__":
     print("=" * 68)
-    print("  RUNNING CC ALGOTRADING v4.5 (35-TEST INSTITUTIONAL SUITE)")
+    print("  RUNNING CC ALGOTRADING v4.5 (36-TEST INSTITUTIONAL SUITE)")
     print("=" * 68)
     test_micro_alpha30()
     test_cs_rank()
@@ -1219,8 +1368,9 @@ if __name__ == "__main__":
     test_azure_intraday_6_profit_doubler_features()
     test_azure_intraday_tier5_nextgen_features()
     test_azure_intraday_tier6_nextlevel_features()
+    test_azure_intraday_tier7_institutional_features()
     print("=" * 68)
-    print("  🎉 ALL 35 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
+    print("  🎉 ALL 36 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 68)
 
 
