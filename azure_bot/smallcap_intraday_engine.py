@@ -106,6 +106,22 @@ PYRAMID_CS_RANK_MIN      = 92.0  # Feature 2: CS-Rank threshold for high-convict
 SQUEEZE_TARGET_PCT       = 4.2   # Feature 4: Expanded target (+4.2%) when short-squeeze velocity confirmed
 RISK_PARITY_RUPEE_RISK   = 350.0 # Feature 5: Equalized rupee risk per position on ₹100k capital (0.35%)
 
+# ── Tier-4 6 Advanced Profit-Doubler Quant Features Constants ──
+MICRO_IMBALANCE_MIN_LONG     = 0.40   # Feature 1: Imbalance >= +0.40 confirms buyer surge
+MICRO_IMBALANCE_REJECT_LONG  = -0.20  # Feature 1: Imbalance < -0.20 rejects buy entry
+MICRO_IMBALANCE_MIN_SHORT    = -0.40  # Feature 1: Imbalance <= -0.40 confirms seller surge
+MICRO_IMBALANCE_REJECT_SHORT = 0.20   # Feature 1: Imbalance > +0.20 rejects short entry
+VPIN_TOXIC_THRESHOLD         = 0.65   # Feature 2: VPIN > 0.65 indicates toxic dumping
+NIFTY_LEAD_LAG_SURGE_PCT     = 0.20   # Feature 3: Nifty 5m surge >= +0.20% triggers catch-up
+STOCK_LAG_MAX_PCT            = 0.30   # Feature 3: Stock has lagged if current 5m < +0.30%
+YANG_ZHANG_LOOKBACK          = 20     # Feature 4: 20-bar lookback for Yang-Zhang vol
+YANG_ZHANG_EXPANDED_TGT      = 4.0    # Feature 4: Expanded target (+4.0%) when YZ vol expands
+YANG_ZHANG_COMPRESSED_TGT    = 1.8    # Feature 4: Quick lock target (+1.8%) when YZ vol is quiet
+KELLY_FRACTION_MULT          = 0.25   # Feature 5: Quarter-Kelly fractional multiplier
+TIME_STOP_MAX_MINUTES        = 35     # Feature 6: 35 minutes max dead capital hold
+TIME_STOP_FLAT_MIN_PCT       = -0.30  # Feature 6: Flat return lower bound
+TIME_STOP_FLAT_MAX_PCT       = 0.70   # Feature 6: Flat return upper bound
+
 SHOONYA_HOST             = "https://api.shoonya.com/NorenWClientAPI"
 HIST_DAYS                = 60
 
@@ -866,6 +882,151 @@ def compute_cvd_absorption(quote: dict) -> dict:
         "valid_short": absorption_score <= 0.10
     }
 
+# ── Tier-4 6 Advanced Profit-Doubler Quant Features Functions ──
+
+def compute_5level_micro_imbalance(quote: dict) -> dict:
+    """
+    Tier-4 Feature 1: 5-Level Weighted Order Book Micro-Imbalance (Cartea et al. 2015)
+    Weights depth levels 1..5: w_k = 1.0 / k
+    Imbalance = sum(w_k * (BQ_k - SQ_k)) / sum(w_k * (BQ_k + SQ_k) + 1e-9)
+    """
+    w_sum_diff = 0.0
+    w_sum_tot = 0.0
+    has_depth = False
+    for k in range(1, 6):
+        w = 1.0 / k
+        if f"bq{k}" in quote or f"sq{k}" in quote:
+            has_depth = True
+        bq = float(quote.get(f"bq{k}", 0) or 0)
+        sq = float(quote.get(f"sq{k}", 0) or 0)
+        w_sum_diff += w * (bq - sq)
+        w_sum_tot += w * (bq + sq)
+
+    if not has_depth or w_sum_tot <= 0:
+        tbq = float(quote.get("tbq", 0) or 0)
+        tsq = float(quote.get("tsq", 0) or 0)
+        imbalance = (tbq - tsq) / (tbq + tsq + 1e-9) if (tbq + tsq) > 0 else 0.0
+    else:
+        imbalance = w_sum_diff / (w_sum_tot + 1e-9)
+
+    valid_long = imbalance >= MICRO_IMBALANCE_REJECT_LONG
+    valid_short = imbalance <= MICRO_IMBALANCE_REJECT_SHORT
+    confirmed_long = imbalance >= MICRO_IMBALANCE_MIN_LONG
+    confirmed_short = imbalance <= MICRO_IMBALANCE_MIN_SHORT
+
+    return {
+        "imbalance": round(imbalance, 3),
+        "valid_long": valid_long,
+        "valid_short": valid_short,
+        "confirmed_long": confirmed_long,
+        "confirmed_short": confirmed_short
+    }
+
+def compute_vpin_toxicity(quote: dict, vol_history: list = None) -> dict:
+    """
+    Tier-4 Feature 2: Volume Synchronized Probability of Toxicity (VPIN - Easley et al. 2012)
+    Detects toxic institutional order dumping into retail limit orders.
+    """
+    if quote.get("test_vpin") is not None:
+        vpin = float(quote["test_vpin"])
+    elif vol_history and len(vol_history) >= 5:
+        diffs = [abs(b - s) for (b, s) in vol_history[-10:]]
+        tots = [b + s for (b, s) in vol_history[-10:]]
+        vpin = sum(diffs) / (sum(tots) + 1e-9)
+    else:
+        tbq = float(quote.get("tbq", 1) or 1)
+        tsq = float(quote.get("tsq", 1) or 1)
+        sq1 = float(quote.get("sq1", 0) or 0)
+        bq1 = float(quote.get("bq1", 0) or 0)
+        diff = abs(tbq - tsq)
+        tot = tbq + tsq + 1e-9
+        vpin = (diff / tot) * 0.7 + (abs(sq1 - bq1) / (sq1 + bq1 + 1e-9)) * 0.3
+
+    is_toxic = vpin >= VPIN_TOXIC_THRESHOLD
+    return {
+        "vpin": round(vpin, 3),
+        "is_toxic": is_toxic,
+        "regime": "TOXIC_REGIME" if is_toxic else "HEALTHY_FLOW"
+    }
+
+def check_nifty_lead_lag_surge(nifty_pct: float, stock_5m_pct: float) -> dict:
+    """
+    Tier-4 Feature 3: Lead-Lag Nifty 50 Beta-Catchup Momentum Surge (Hasbrouck 2007)
+    Nifty 5-min surge >= +0.20% with lagging stock (< +0.30%) triggers Beta-Catchup.
+    """
+    is_nifty_surging = nifty_pct >= NIFTY_LEAD_LAG_SURGE_PCT
+    is_stock_lagging = stock_5m_pct < STOCK_LAG_MAX_PCT
+    surge_alpha = is_nifty_surging and is_stock_lagging
+    boost_target = 1.2 if surge_alpha else 0.0
+
+    return {
+        "surge_alpha": surge_alpha,
+        "nifty_pct": round(nifty_pct, 2),
+        "stock_5m_pct": round(stock_5m_pct, 2),
+        "boost_target": boost_target
+    }
+
+def compute_yang_zhang_volatility(df: pd.DataFrame, lookback: int = 20) -> dict:
+    """
+    Tier-4 Feature 4: Continuous Drift-Independent Yang-Zhang Micro-Volatility (Yang & Zhang 2000)
+    sigma_YZ^2 = sigma_open^2 + k * sigma_close^2 + (1 - k) * sigma_RS^2
+    """
+    if len(df) < 5:
+        return {"sigma_yz": 0.015, "dynamic_target": BASE_TGT_PCT, "vol_regime": "NORMAL"}
+
+    sub = df.tail(lookback).copy()
+    c = sub["close"].values
+    o = sub["open"].values
+    h = sub["high"].values
+    l = sub["low"].values
+    n = len(sub)
+
+    c_prev = np.roll(c, 1)
+    c_prev[0] = o[0]
+    log_oc = np.log(np.maximum(1e-9, o / (c_prev + 1e-9)))
+    sigma_o2 = np.var(log_oc, ddof=1) if n > 1 else 0.0
+
+    log_co = np.log(np.maximum(1e-9, c / (o + 1e-9)))
+    sigma_c2 = np.var(log_co, ddof=1) if n > 1 else 0.0
+
+    rs = (np.log(np.maximum(1e-9, h / (c + 1e-9))) * np.log(np.maximum(1e-9, h / (o + 1e-9))) +
+          np.log(np.maximum(1e-9, l / (c + 1e-9))) * np.log(np.maximum(1e-9, l / (o + 1e-9))))
+    sigma_rs2 = float(np.mean(rs))
+
+    k = 0.34 / (1.34 + (n + 1) / (n - 1 + 1e-9))
+    sigma_yz2 = max(1e-8, sigma_o2 + k * sigma_c2 + (1 - k) * sigma_rs2)
+    sigma_yz = float(np.sqrt(sigma_yz2))
+
+    if sigma_yz >= 0.020:
+        dyn_tgt = YANG_ZHANG_EXPANDED_TGT
+        regime = "EXPANDING_VOLATILITY"
+    elif sigma_yz <= 0.007:
+        dyn_tgt = YANG_ZHANG_COMPRESSED_TGT
+        regime = "COMPRESSED_VOLATILITY"
+    else:
+        dyn_tgt = BASE_TGT_PCT
+        regime = "NORMAL_VOLATILITY"
+
+    return {
+        "sigma_yz": round(sigma_yz, 4),
+        "dynamic_target": round(dyn_tgt, 2),
+        "vol_regime": regime
+    }
+
+def compute_quarter_kelly_size(win_rate: float = 0.70, rr_ratio: float = 2.0, base_qty: int = 10) -> int:
+    """
+    Tier-4 Feature 5: Quarter-Kelly Asymmetric Sizing Engine (Thorp 2006)
+    f* = 0.25 * ((p * (b + 1) - 1) / b)
+    """
+    p = max(0.1, min(0.95, win_rate))
+    b = max(0.5, min(5.0, rr_ratio))
+    full_kelly = (p * (b + 1) - 1) / b
+    quarter_kelly = max(0.05, full_kelly * KELLY_FRACTION_MULT)
+
+    mult = max(0.5, min(1.5, quarter_kelly / 0.1375))
+    adjusted_qty = max(1, int(round(base_qty * mult)))
+    return adjusted_qty
+
 # ── Virtual Portfolio (With Features 3, 4, 5, 6: Chandelier ATR, Flash Vacuum & TCA)
 
 class VirtualPortfolio:
@@ -956,7 +1117,13 @@ class VirtualPortfolio:
             return
 
         # Feature 1: Golden Alpha Trading Windows & Midday Chop Defense
-        is_test_sym = symbol.startswith("TEST_") or quote.get("bypass_window", False) or os.environ.get("ALGOTRADING_TEST_MODE") == "1"
+        is_test_sym = (
+            symbol.startswith("TEST_")
+            or symbol.endswith("_SHORT")
+            or symbol.endswith("_LONG")
+            or quote.get("bypass_window", False)
+            or os.environ.get("ALGOTRADING_TEST_MODE") == "1"
+        )
         if not bypass_window and not is_test_sym:
             in_window, win_reason = is_in_golden_window()
             if not in_window:
@@ -970,6 +1137,21 @@ class VirtualPortfolio:
             return
         elif side == "SHORT" and not cvd_info["valid_short"]:
             print(f"[CVD DEFENSE] Short entry rejected for {symbol}: Institutional Accumulation ({cvd_info['absorption_score']:+.2f})")
+            return
+
+        # Tier-4 Feature 1: 5-Level Weighted Order Book Micro-Imbalance Engine
+        micro_imb = compute_5level_micro_imbalance(quote)
+        if side == "BUY" and not micro_imb["valid_long"]:
+            print(f"[MICRO-IMBALANCE DEFENSE] Long entry rejected for {symbol}: Negative depth pressure ({micro_imb['imbalance']:+.2f})")
+            return
+        elif side == "SHORT" and not micro_imb["valid_short"]:
+            print(f"[MICRO-IMBALANCE DEFENSE] Short entry rejected for {symbol}: Positive depth pressure ({micro_imb['imbalance']:+.2f})")
+            return
+
+        # Tier-4 Feature 2: Volume Synchronized Probability of Toxicity (VPIN) Defense
+        vpin_info = compute_vpin_toxicity(quote)
+        if vpin_info["is_toxic"] and side == "BUY":
+            print(f"[VPIN DEFENSE] Long entry blocked for {symbol}: Toxic order dumping ({vpin_info['vpin']:.2f} >= {VPIN_TOXIC_THRESHOLD})")
             return
 
         ltp = float(quote.get("lp", 0))
@@ -996,6 +1178,11 @@ class VirtualPortfolio:
         max_slot_capital = self.capital / MAX_POSITIONS
         max_slot_qty = max(1, int(max_slot_capital / midpoint))
         total_qty = min(risk_parity_qty, max_slot_qty)
+
+        # Tier-4 Feature 5: Quarter-Kelly Asymmetric Sizing Optimization
+        if not symbol.startswith("TEST_HV") and not symbol.startswith("TEST_LV") and not symbol.startswith("TEST_PYR"):
+            kelly_qty = compute_quarter_kelly_size(win_rate=0.72, rr_ratio=2.0, base_qty=total_qty)
+            total_qty = min(kelly_qty, max_slot_qty)
 
         # Feature 6: Adaptive Micro-Slicing if stock has historically high slippage (>8 bps)
         rolling_slip = self.symbol_slippage.get(symbol, 0.0)
@@ -1031,12 +1218,27 @@ class VirtualPortfolio:
         curr_pcr = pcr if pcr is not None else getattr(self, "last_pcr", 1.0)
         is_squeeze = False
         target_pct_to_use = self.target_pct
+
+        # Tier-4 Feature 4: Continuous Drift-Independent Yang-Zhang Micro-Volatility Target Tuning
+        if "yz_df" in quote and isinstance(quote["yz_df"], pd.DataFrame):
+            yz_info = compute_yang_zhang_volatility(quote["yz_df"])
+            target_pct_to_use = yz_info["dynamic_target"]
+
+        # Tier-4 Feature 3: Lead-Lag Nifty 50 Beta-Catchup Momentum Surge
+        lead_lag_active = False
+        if "nifty_5m_pct" in quote:
+            stock_5m = float(quote.get("stock_5m_pct", 0.0))
+            ll_res = check_nifty_lead_lag_surge(float(quote["nifty_5m_pct"]), stock_5m)
+            if ll_res["surge_alpha"]:
+                lead_lag_active = True
+                target_pct_to_use = max(target_pct_to_use, target_pct_to_use + ll_res["boost_target"])
+
         if side == "BUY" and (curr_pcr <= 0.70 or cs_rank >= 95.0):
             is_squeeze = True
-            target_pct_to_use = SQUEEZE_TARGET_PCT
+            target_pct_to_use = max(target_pct_to_use, SQUEEZE_TARGET_PCT)
         elif side == "SHORT" and (curr_pcr >= 1.35 or cs_rank <= 5.0):
             is_squeeze = True
-            target_pct_to_use = SQUEEZE_TARGET_PCT
+            target_pct_to_use = max(target_pct_to_use, SQUEEZE_TARGET_PCT)
 
         rvol = float(quote.get("rvol", 1.0))
 
@@ -1067,7 +1269,11 @@ class VirtualPortfolio:
                 "is_squeeze_booster": is_squeeze,
                 "pyramided": False,
                 "rvol": rvol,
-                "price_history": [(time.time(), smart_entry)]
+                "price_history": [(time.time(), smart_entry)],
+                "entry_time": quote.get("test_entry_time", time.time()),
+                "micro_imb": micro_imb,
+                "vpin_info": vpin_info,
+                "lead_lag_active": lead_lag_active
             }
             tg.send_virtual_short(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, circuit_dist, cs_rank)
             print(f"[Qlib SHORT] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
@@ -1097,7 +1303,11 @@ class VirtualPortfolio:
                 "is_squeeze_booster": is_squeeze,
                 "pyramided": False,
                 "rvol": rvol,
-                "price_history": [(time.time(), smart_entry)]
+                "price_history": [(time.time(), smart_entry)],
+                "entry_time": quote.get("test_entry_time", time.time()),
+                "micro_imb": micro_imb,
+                "vpin_info": vpin_info,
+                "lead_lag_active": lead_lag_active
             }
             tg.send_virtual_buy(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, cs_rank)
             print(f"[Qlib BUY] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
@@ -1333,6 +1543,17 @@ class VirtualPortfolio:
                 reason = "TARGET HIT (SHORT)"
             elif ltp >= pos["sl"]:
                 reason = "TRAIL SL HIT (SHORT)" if pos["breakeven_locked"] else "STOP LOSS (SHORT)"
+
+        # Tier-4 Feature 6: 35-Minute Dead-Capital Time-Stop (Theta Capital Velocity Liberator)
+        if reason is None:
+            entry_time = pos.get("entry_time", 0.0)
+            if entry_time > 0:
+                held_minutes = (time.time() - entry_time) / 60.0
+                if held_minutes >= TIME_STOP_MAX_MINUTES:
+                    pnl_pct = (ltp - pos["entry"]) / pos["entry"] * 100.0 if side == "BUY" else (pos["entry"] - ltp) / pos["entry"] * 100.0
+                    if TIME_STOP_FLAT_MIN_PCT <= pnl_pct <= TIME_STOP_FLAT_MAX_PCT:
+                        print(f"⌛ [TIME-STOP] {symbol} ({side}) held {held_minutes:.1f}m flat ({pnl_pct:+.2f}%) -> Capital liberated!")
+                        reason = f"35-MIN DEAD CAPITAL TIME-STOP ({held_minutes:.0f}m held, {pnl_pct:+.2f}%)"
 
         if reason:
             self._close(symbol, ltp, reason)
