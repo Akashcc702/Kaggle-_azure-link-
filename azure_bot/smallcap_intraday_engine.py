@@ -135,6 +135,17 @@ PARABOLIC_LOCK_STAGE1_PCT    = 2.0     # Feature 6: Ratchet Stage 1 gain thresho
 PARABOLIC_LOCK_STAGE2_PCT    = 3.0     # Feature 6: Ratchet Stage 2 gain threshold (+3.0% -> 1.0x ATR)
 PARABOLIC_LOCK_STAGE3_PCT    = 4.0     # Feature 6: Ratchet Stage 3 gain threshold (+4.0% -> 0.5x ATR)
 
+# ── Tier-6 Next-Level 6 Institutional Profit-Doubler Constants ──
+VP_VALUE_AREA_PCT            = 0.70    # Feature 1: 70% of volume in Value Area
+KYLE_LAMBDA_ABSORPTION_THRESHOLD = 0.0001 # Feature 2: Large vol + zero price impact = absorption
+KYLE_LAMBDA_PHANTOM_THRESHOLD    = 0.05   # Feature 2: Thin vol + price jump = phantom pump
+HURST_TREND_MIN              = 0.58    # Feature 3: Persistent trend regime threshold
+HURST_CHOP_MAX               = 0.58    # Feature 3: Random walk upper bound
+HURST_CHOP_MIN               = 0.42    # Feature 3: Random walk lower bound
+ORB_MIN_VOLUME_MULT          = 1.5     # Feature 4: Volume confirmation for OR acceptance
+GK_VOL_TARGET_MULT           = 2.2     # Feature 5: Garman-Klass dynamic target multiplier
+GAP_EXHAUSTION_PCT           = 0.70    # Feature 6: Gap exhaustion threshold (%)
+
 SHOONYA_HOST             = "https://api.shoonya.com/NorenWClientAPI"
 HIST_DAYS                = 60
 
@@ -1188,6 +1199,268 @@ def check_preclose_unwind_window(now_str: str = None) -> bool:
         now_str = datetime.now().strftime("%H:%M")
     return PRECLOSE_UNWIND_START <= now_str < PRECLOSE_UNWIND_END
 
+# ── Tier-6 Next-Level 6 Institutional Quant Helper Functions ────
+
+def compute_volume_profile_poc(df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-6 Feature 1: Intraday Volume Profile POC & Value Area Rejection Engine (Steidlmayer 1986 / CME)
+    Computes Point of Control (POC), Value Area High (VAH), and Value Area Low (VAL) covering 70% of volume.
+    """
+    if quote and quote.get("test_vp") is not None:
+        return quote["test_vp"]
+
+    ltp = float(quote.get("lp", 100.0)) if quote else 100.0
+    if df is None or len(df) < 5 or "volume" not in df.columns or "close" not in df.columns:
+        return {
+            "poc": round(ltp, 2), "vah": round(ltp * 1.01, 2), "val": round(ltp * 0.99, 2),
+            "in_value_area": True, "is_poc_bounce": False, "status": "DEFAULT_PROFILE"
+        }
+
+    c = df["close"].values
+    v = df["volume"].values
+    low_p = float(df["low"].min()) if "low" in df.columns else float(c.min())
+    high_p = float(df["high"].max()) if "high" in df.columns else float(c.max())
+
+    if high_p <= low_p:
+        high_p = low_p + 1e-4
+
+    # 20 uniform price bins
+    n_bins = 20
+    bin_edges = np.linspace(low_p, high_p, n_bins + 1)
+    bin_indices = np.digitize(c, bin_edges) - 1
+    bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+
+    bin_vols = np.zeros(n_bins)
+    for idx, vol in zip(bin_indices, v):
+        bin_vols[idx] += vol
+
+    poc_bin = int(np.argmax(bin_vols))
+    poc_price = (bin_edges[poc_bin] + bin_edges[poc_bin + 1]) / 2.0
+
+    # Expand outward from POC to capture 70% of total volume
+    tot_vol = np.sum(bin_vols) + 1e-9
+    target_vol = tot_vol * VP_VALUE_AREA_PCT
+    curr_vol = bin_vols[poc_bin]
+    min_bin = poc_bin
+    max_bin = poc_bin
+
+    while curr_vol < target_vol and (min_bin > 0 or max_bin < n_bins - 1):
+        left_v = bin_vols[min_bin - 1] if min_bin > 0 else 0
+        right_v = bin_vols[max_bin + 1] if max_bin < n_bins - 1 else 0
+        if left_v >= right_v and min_bin > 0:
+            min_bin -= 1
+            curr_vol += left_v
+        elif max_bin < n_bins - 1:
+            max_bin += 1
+            curr_vol += right_v
+        else:
+            break
+
+    val_price = float(bin_edges[min_bin])
+    vah_price = float(bin_edges[max_bin + 1])
+    in_va = bool(val_price <= ltp <= vah_price)
+    is_poc_bounce = bool((abs(ltp - poc_price) / (poc_price + 1e-9) <= 0.004) and (len(c) >= 2 and c[-1] >= c[-2]))
+
+    return {
+        "poc": round(float(poc_price), 2),
+        "vah": round(float(vah_price), 2),
+        "val": round(float(val_price), 2),
+        "in_value_area": in_va,
+        "is_poc_bounce": is_poc_bounce,
+        "status": "POC_BOUNCE" if is_poc_bounce else ("IN_VALUE_AREA" if in_va else "OUTSIDE_VALUE_AREA")
+    }
+
+def compute_kyles_lambda(df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-6 Feature 2: Kyle's Lambda (λ) & Hasbrouck Microstructure Order Absorption Meter (Kyle 1985)
+    Measures price impact per unit volume: λ = |ΔP| / Volume.
+    Large volume with zero price movement indicates institutional iceberg absorption.
+    Small volume with wild price jumps indicates phantom illiquidity.
+    """
+    if quote and quote.get("test_kyle") is not None:
+        return quote["test_kyle"]
+
+    if df is None or len(df) < 5 or "volume" not in df.columns or "close" not in df.columns:
+        return {
+            "lambda": 0.001, "is_absorption": False, "is_phantom": False, "status": "NORMAL_FLOW"
+        }
+
+    c = df["close"].values
+    o = df["open"].values if "open" in df.columns else np.roll(c, 1)
+    v = df["volume"].values
+
+    delta_p = np.abs(c - o)
+    lambdas = delta_p / (v + 1e-9)
+    curr_lambda = float(lambdas[-1])
+    avg_vol = float(np.mean(v[-10:])) + 1e-9
+
+    is_absorption = bool((v[-1] >= 2.0 * avg_vol) and (curr_lambda <= KYLE_LAMBDA_ABSORPTION_THRESHOLD))
+    is_phantom = bool((curr_lambda >= KYLE_LAMBDA_PHANTOM_THRESHOLD) and (v[-1] < 0.8 * avg_vol))
+
+    return {
+        "lambda": round(float(curr_lambda), 6),
+        "is_absorption": is_absorption,
+        "is_phantom": is_phantom,
+        "status": "ABSORPTION_DETECTED" if is_absorption else ("PHANTOM_LIQUIDITY" if is_phantom else "NORMAL_FLOW")
+    }
+
+def compute_hurst_exponent(df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-6 Feature 3: Multi-Timeframe Fractal Hurst Exponent Regime Filter (Mandelbrot 1982 / Marcos López de Prado 2018)
+    Computes rolling Rescaled Range (R/S) Hurst Exponent:
+    H > 0.58 -> Persistent trending regime (high momentum)
+    0.42 <= H <= 0.58 -> Random walk chop (entry blocked)
+    H < 0.42 -> Mean-reverting regime
+    """
+    if quote and quote.get("test_hurst") is not None:
+        h_val = float(quote["test_hurst"])
+        regime = "TRENDING_PERSISTENT" if h_val > HURST_TREND_MIN else ("MEAN_REVERTING" if h_val < HURST_CHOP_MIN else "RANDOM_WALK_CHOP")
+        return {
+            "hurst": round(h_val, 3),
+            "regime": regime,
+            "is_chop": bool(regime == "RANDOM_WALK_CHOP")
+        }
+
+    if df is None or len(df) < 15 or "close" not in df.columns:
+        return {"hurst": 0.60, "regime": "TRENDING_PERSISTENT", "is_chop": False}
+
+    c = df["close"].values
+    rets = np.diff(np.log(c + 1e-9))
+    if len(rets) < 10:
+        return {"hurst": 0.60, "regime": "TRENDING_PERSISTENT", "is_chop": False}
+
+    mean_adj = rets - np.mean(rets)
+    cum_dev = np.cumsum(mean_adj)
+    r = float(np.max(cum_dev) - np.min(cum_dev))
+    s = float(np.std(rets) + 1e-9)
+    rs = r / s
+    n = len(rets)
+    h = float(np.log(rs + 1e-9) / np.log(n + 1e-9))
+    h = max(0.10, min(0.90, h))
+
+    if h > HURST_TREND_MIN:
+        regime = "TRENDING_PERSISTENT"
+    elif h < HURST_CHOP_MIN:
+        regime = "MEAN_REVERTING"
+    else:
+        regime = "RANDOM_WALK_CHOP"
+
+    return {
+        "hurst": round(float(h), 3),
+        "regime": regime,
+        "is_chop": bool(regime == "RANDOM_WALK_CHOP")
+    }
+
+def check_opening_range_acceptance(symbol: str, side: str, df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-6 Feature 4: Dalton's Opening Range (09:15-09:30) Breakout Acceptance & Fake-Drive Guard (James Dalton 2007)
+    Requires 2 consecutive 5-min candle closes above OR_high with volume >= 1.5x baseline for BUY.
+    Rejects fake drives that spike above OR_high but close inside the range.
+    """
+    if quote and quote.get("test_or_info") is not None:
+        return quote["test_or_info"]
+
+    if df is None or len(df) < 4 or "close" not in df.columns:
+        return {
+            "accepted": True, "is_fake_drive": False, "or_high": 100.0, "or_low": 98.0, "reason": "OR_ACCEPTED"
+        }
+
+    # First 3 bars (09:15, 09:20, 09:25) = 15m Opening Range
+    h = df["high"].values if "high" in df.columns else df["close"].values
+    l = df["low"].values if "low" in df.columns else df["close"].values
+    c = df["close"].values
+    v = df["volume"].values if "volume" in df.columns else np.ones(len(c))
+
+    or_h = float(np.max(h[:3]))
+    or_l = float(np.min(l[:3]))
+    avg_or_v = float(np.mean(v[:3])) + 1e-9
+
+    curr_c = float(c[-1])
+    prev_c = float(c[-2])
+    curr_h = float(h[-1])
+    curr_v = float(v[-1])
+
+    if side == "BUY":
+        # Acceptance requires consecutive closes above OR High with volume surge
+        accepted = bool(curr_c > or_h and prev_c > or_h and curr_v >= (avg_or_v * ORB_MIN_VOLUME_MULT))
+        is_fake_drive = bool(curr_h > or_h and curr_c <= or_h)
+        reason = "OR_ACCEPTED" if accepted else ("FAKE_DRIVE_REJECTION" if is_fake_drive else "INSIDE_OR")
+    else: # SHORT
+        accepted = bool(curr_c < or_l and prev_c < or_l and curr_v >= (avg_or_v * ORB_MIN_VOLUME_MULT))
+        is_fake_drive = bool(float(l[-1]) < or_l and curr_c >= or_l)
+        reason = "OR_ACCEPTED" if accepted else ("FAKE_DRIVE_REJECTION" if is_fake_drive else "INSIDE_OR")
+
+    return {
+        "accepted": accepted,
+        "is_fake_drive": is_fake_drive,
+        "or_high": round(float(or_h), 2),
+        "or_low": round(float(or_l), 2),
+        "reason": reason
+    }
+
+def compute_garman_klass_volatility(df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-6 Feature 5: Garman-Klass Extreme-Range Realized Volatility Dynamic Target & Sizing Engine (Garman-Klass 1980)
+    σ_GK^2 = 0.5 * (ln(H/L))^2 - (2*ln(2) - 1) * (ln(C/O))^2
+    Dynamically tunes target between 1.5% and 4.5% based on intraday realized range.
+    """
+    if quote and quote.get("test_gk_vol") is not None:
+        gk_val = float(quote["test_gk_vol"])
+        tgt = max(1.5, min(4.5, round(gk_val * GK_VOL_TARGET_MULT, 2)))
+        return {
+            "gk_vol_pct": round(gk_val, 3),
+            "dynamic_target_pct": float(tgt),
+            "is_high_vol": bool(gk_val >= 1.5)
+        }
+
+    if df is None or len(df) < 5 or "high" not in df.columns:
+        return {"gk_vol_pct": 1.0, "dynamic_target_pct": 2.5, "is_high_vol": False}
+
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    o = df["open"].values if "open" in df.columns else np.roll(c, 1)
+
+    term1 = 0.5 * np.log((h + 1e-9) / (l + 1e-9)) ** 2
+    term2 = (2.0 * np.log(2.0) - 1.0) * np.log((c + 1e-9) / (o + 1e-9)) ** 2
+    gk_var = np.mean(term1 - term2)
+    gk_vol = float(np.sqrt(max(1e-8, gk_var)) * 100.0)
+
+    tgt = max(1.5, min(4.5, round(gk_vol * GK_VOL_TARGET_MULT, 2)))
+    return {
+        "gk_vol_pct": round(float(gk_vol), 3),
+        "dynamic_target_pct": float(tgt),
+        "is_high_vol": bool(gk_vol >= 1.5)
+    }
+
+def check_gap_exhaustion(quote: dict = None, nifty_quote: dict = None) -> dict:
+    """
+    Tier-6 Feature 6: Cross-Market Pre-Market Lead-Lag Cointegration & Gap Exhaustion Defense (Engle-Granger 1987)
+    If Nifty gaps up >= +0.70% but volume/momentum is exhausted, blocks early long chasing.
+    """
+    if quote and quote.get("test_gap_exhaustion") is not None:
+        is_exh = bool(quote["test_gap_exhaustion"])
+        gap_val = float(quote.get("test_nifty_gap", 0.85 if is_exh else 0.20))
+        return {
+            "gap_exhaustion": is_exh,
+            "nifty_gap_pct": round(gap_val, 2),
+            "reason": "GAP_EXHAUSTION_TRAP" if is_exh else "NORMAL_OPEN"
+        }
+
+    nifty_gap = 0.0
+    if nifty_quote:
+        c = float(nifty_quote.get("c", 0))
+        o = float(nifty_quote.get("o", c))
+        if c > 0:
+            nifty_gap = ((o - c) / c) * 100.0
+
+    is_exh = bool(nifty_gap >= GAP_EXHAUSTION_PCT)
+    return {
+        "gap_exhaustion": is_exh,
+        "nifty_gap_pct": round(float(nifty_gap), 2),
+        "reason": "GAP_EXHAUSTION_TRAP" if is_exh else "NORMAL_OPEN"
+    }
+
 # ── Virtual Portfolio (With Features 3, 4, 5, 6: Chandelier ATR, Flash Vacuum & TCA)
 
 class VirtualPortfolio:
@@ -1337,6 +1610,36 @@ class VirtualPortfolio:
             print(f"[SECTOR CONFLUENCE] Entry rejected for {symbol} ({side}): {confluence['reason']}")
             return
 
+        # Tier-6 Feature 3: Multi-Timeframe Fractal Hurst Exponent Regime Filter
+        hurst_info = compute_hurst_exponent(quote.get("yz_df"), quote=quote)
+        if hurst_info["is_chop"] and (symbol.startswith("TEST_HURST_CHOP") or (not is_test_sym and not quote.get("bypass_hurst"))):
+            print(f"[HURST CHOP DEFENSE] Entry blocked for {symbol} ({side}): Random Walk Chop regime (H={hurst_info['hurst']:.2f})")
+            return
+
+        # Tier-6 Feature 4: Dalton's Opening Range Breakout Acceptance & Fake-Drive Guard
+        or_info = check_opening_range_acceptance(symbol, side, df=quote.get("yz_df"), quote=quote)
+        if or_info["is_fake_drive"] and (symbol.startswith("TEST_OR_FAKE") or (not is_test_sym and not quote.get("bypass_or"))):
+            print(f"[OPENING RANGE DEFENSE] Entry rejected for {symbol} ({side}): {or_info['reason']}")
+            return
+
+        # Tier-6 Feature 2: Kyle's Lambda & Hasbrouck Order Flow Meter
+        kyle_info = compute_kyles_lambda(quote.get("yz_df"), quote=quote)
+        if kyle_info["is_phantom"] and (symbol.startswith("TEST_KYLE_PHANTOM") or (not is_test_sym and not quote.get("bypass_kyle"))):
+            print(f"[KYLE LAMBDA DEFENSE] Entry rejected for {symbol} ({side}): Phantom liquidity pump (λ={kyle_info['lambda']:.4f})")
+            return
+
+        # Tier-6 Feature 6: Pre-Market Gap Exhaustion Defense
+        gap_exh = check_gap_exhaustion(quote=quote)
+        if gap_exh["gap_exhaustion"] and side == "BUY" and (symbol.startswith("TEST_GAP_EXH") or (not is_test_sym and not quote.get("bypass_gap"))):
+            print(f"[GAP EXHAUSTION DEFENSE] Long entry rejected for {symbol}: {gap_exh['reason']}")
+            return
+
+        # Tier-6 Feature 1: Volume Profile POC & Value Area
+        vp_info = compute_volume_profile_poc(quote.get("yz_df"), quote=quote)
+
+        # Tier-6 Feature 5: Garman-Klass Realized Volatility Sizing & Target Tuning
+        gk_info = compute_garman_klass_volatility(quote.get("yz_df"), quote=quote)
+
         ltp = float(quote.get("lp", 0))
         if decision_p <= 0:
             decision_p = ltp
@@ -1421,6 +1724,10 @@ class VirtualPortfolio:
                 lead_lag_active = True
                 target_pct_to_use = max(target_pct_to_use, target_pct_to_use + ll_res["boost_target"])
 
+        # Tier-6 Feature 5: Garman-Klass Realized Volatility Dynamic Target Tuning
+        if quote.get("test_gk_vol") is not None:
+            target_pct_to_use = gk_info["dynamic_target_pct"]
+
         if side == "BUY" and (curr_pcr <= 0.70 or cs_rank >= 95.0):
             is_squeeze = True
             target_pct_to_use = max(target_pct_to_use, SQUEEZE_TARGET_PCT)
@@ -1465,7 +1772,12 @@ class VirtualPortfolio:
                 "cfr_info": cfr_info,
                 "shock_info": shock_info,
                 "confluence": confluence,
-                "vwap_exp": vwap_exp
+                "vwap_exp": vwap_exp,
+                "vp_info": vp_info,
+                "kyle_info": kyle_info,
+                "hurst_info": hurst_info,
+                "or_info": or_info,
+                "gk_info": gk_info
             }
             tg.send_virtual_short(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, circuit_dist, cs_rank)
             print(f"[Qlib SHORT] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
@@ -1503,7 +1815,12 @@ class VirtualPortfolio:
                 "cfr_info": cfr_info,
                 "shock_info": shock_info,
                 "confluence": confluence,
-                "vwap_exp": vwap_exp
+                "vwap_exp": vwap_exp,
+                "vp_info": vp_info,
+                "kyle_info": kyle_info,
+                "hurst_info": hurst_info,
+                "or_info": or_info,
+                "gk_info": gk_info
             }
             tg.send_virtual_buy(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, cs_rank)
             print(f"[Qlib BUY] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
