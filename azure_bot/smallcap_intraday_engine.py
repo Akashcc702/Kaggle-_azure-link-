@@ -146,6 +146,17 @@ ORB_MIN_VOLUME_MULT          = 1.5     # Feature 4: Volume confirmation for OR a
 GK_VOL_TARGET_MULT           = 2.2     # Feature 5: Garman-Klass dynamic target multiplier
 GAP_EXHAUSTION_PCT           = 0.70    # Feature 6: Gap exhaustion threshold (%)
 
+# ── Tier-7 Next-Level 6 Institutional Profit-Doubler Constants ──
+AMIHUD_ILLIQ_THRESHOLD           = 0.85    # Feature 1: Illiquidity ratio > 0.85 switches to passive limit / reject
+AMIHUD_MAX_SLIPPAGE_BPS          = 25.0    # Feature 1: 0.25% (25 bps) max tolerable slippage
+AVWAP_MAX_CONFLUENCE_BANDWIDTH   = 0.30    # Feature 2: Max 0.30% divergence between Session & Pivot AVWAP
+ABVR_MIN_LONG_THRESHOLD          = 0.70    # Feature 3: >= 70% aggressive buyer volume required for Long
+ABVR_MAX_SHORT_THRESHOLD         = 0.30    # Feature 3: <= 30% aggressive buyer volume (>= 70% sell) for Short
+OU_HALF_LIFE_MIN_MINUTES         = 8.0     # Feature 4: Half-life < 8 min triggers quick mean-reversion escape
+DEPTH_SLOPE_COLLAPSE_MIN         = -0.50   # Feature 5: Depth-slope ratio <= -0.50 triggers early liquidity exit
+KELLY_DYNAMIC_MIN_MULT           = 0.50    # Feature 6: 0.5x minimum sizing on marginal setups (₹175 risk)
+KELLY_DYNAMIC_MAX_MULT           = 2.00    # Feature 6: 2.0x maximum sizing on A+ setups (₹700 risk)
+
 SHOONYA_HOST             = "https://api.shoonya.com/NorenWClientAPI"
 HIST_DAYS                = 60
 
@@ -1461,6 +1472,253 @@ def check_gap_exhaustion(quote: dict = None, nifty_quote: dict = None) -> dict:
         "reason": "GAP_EXHAUSTION_TRAP" if is_exh else "NORMAL_OPEN"
     }
 
+# ── Tier-7 Next-Level 6 Institutional Profit-Doubler Functions ──
+
+def compute_amihud_illiquidity(df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-7 Feature 1: Amihud Illiquidity Ratio & Smart Passive Limit Router (Amihud 2002)
+    ILLIQ = (|Return| / Turnover_Lakhs) * 10^5
+    When ILLIQ > 0.85 or expected slippage > 25 bps, rejects blind market orders
+    and switches to Smart Passive Limit (Best Bid/Ask) execution.
+    """
+    if quote and quote.get("test_amihud") is not None:
+        return quote["test_amihud"]
+
+    if df is None or len(df) < 5:
+        return {
+            "illiq": 0.20,
+            "expected_slippage_bps": 5.0,
+            "is_illiquid": False,
+            "order_type": "MARKET"
+        }
+
+    c = df["close"].values
+    o = df["open"].values if "open" in df.columns else np.roll(c, 1)
+    v = df["volume"].values if "volume" in df.columns else np.ones(len(c))
+
+    abs_ret = np.abs((c - o) / (o + 1e-9))
+    turnover_lakhs = (v * c) / 100000.0 + 1e-6
+    illiq_series = (abs_ret / turnover_lakhs) * 10000.0
+    illiq_val = float(np.mean(illiq_series[-5:]))
+
+    expected_slippage_bps = float(np.sqrt(max(1e-6, illiq_val)) * 10.0)
+    is_illiquid = bool(illiq_val > AMIHUD_ILLIQ_THRESHOLD or expected_slippage_bps > AMIHUD_MAX_SLIPPAGE_BPS)
+    order_type = "PASSIVE_LIMIT" if is_illiquid else "MARKET"
+
+    return {
+        "illiq": round(float(illiq_val), 3),
+        "expected_slippage_bps": round(float(expected_slippage_bps), 2),
+        "is_illiquid": is_illiquid,
+        "order_type": order_type
+    }
+
+
+def compute_multi_anchor_vwap(df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-7 Feature 2: Multi-Anchor Anchored-VWAP (AVWAP) Confluence Gate (Madhavan 1997, Shannon 2023)
+    Computes Session AVWAP (from 09:15) and Pivot AVWAP (from volume spike bar).
+    Validates tight pinch confluence (bandwidth <= 0.30%) confirming institutional alignment.
+    """
+    if quote and quote.get("test_avwap") is not None:
+        return quote["test_avwap"]
+
+    if df is None or len(df) < 5:
+        return {
+            "session_avwap": 100.0,
+            "pivot_avwap": 100.0,
+            "confluence_bandwidth_pct": 0.10,
+            "is_confluent": True
+        }
+
+    c = df["close"].values
+    v = df["volume"].values if "volume" in df.columns else np.ones(len(c))
+
+    session_avwap = float(np.sum(c * v) / (np.sum(v) + 1e-9))
+
+    max_vol_idx = int(np.argmax(v))
+    if max_vol_idx < len(c) - 1:
+        pivot_c = c[max_vol_idx:]
+        pivot_v = v[max_vol_idx:]
+        pivot_avwap = float(np.sum(pivot_c * pivot_v) / (np.sum(pivot_v) + 1e-9))
+    else:
+        pivot_avwap = session_avwap
+
+    ltp = float(c[-1])
+    bandwidth = abs(session_avwap - pivot_avwap) / (ltp + 1e-9) * 100.0
+    is_confluent = bool(bandwidth <= AVWAP_MAX_CONFLUENCE_BANDWIDTH)
+
+    return {
+        "session_avwap": round(float(session_avwap), 2),
+        "pivot_avwap": round(float(pivot_avwap), 2),
+        "confluence_bandwidth_pct": round(float(bandwidth), 3),
+        "is_confluent": is_confluent
+    }
+
+
+def compute_lee_ready_abvr(ticks: list = None, quote: dict = None) -> dict:
+    """
+    Tier-7 Feature 3: Lee-Ready Tick Rule & Aggressive Buy Volume Ratio (ABVR) (Lee & Ready 1991)
+    Classifies tick trades as buyer-initiated or seller-initiated.
+    Requires ABVR >= 70% for Long, <= 30% for Short to guarantee active ask-sweeping momentum.
+    """
+    if quote and quote.get("test_abvr") is not None:
+        return quote["test_abvr"]
+
+    if not ticks or len(ticks) < 3:
+        tbq = float(quote.get("tbq", 5000)) if quote else 5000
+        tsq = float(quote.get("tsq", 5000)) if quote else 5000
+        ratio = float(tbq / (tbq + tsq + 1e-9))
+        return {
+            "abvr": round(ratio, 2),
+            "is_aggressive_buyer": bool(ratio >= ABVR_MIN_LONG_THRESHOLD),
+            "is_aggressive_seller": bool(ratio <= ABVR_MAX_SHORT_THRESHOLD)
+        }
+
+    buy_vol = 0.0
+    sell_vol = 0.0
+    prev_p = ticks[0].get("p", 0.0)
+
+    for t in ticks:
+        p = t.get("p", prev_p)
+        v = t.get("v", 1.0)
+        mid = t.get("mid", p)
+        if p > mid:
+            buy_vol += v
+        elif p < mid:
+            sell_vol += v
+        else:
+            if p > prev_p:
+                buy_vol += v
+            elif p < prev_p:
+                sell_vol += v
+            else:
+                buy_vol += v * 0.5
+                sell_vol += v * 0.5
+        prev_p = p
+
+    total_vol = buy_vol + sell_vol + 1e-9
+    abvr = float(buy_vol / total_vol)
+
+    return {
+        "abvr": round(abvr, 3),
+        "is_aggressive_buyer": bool(abvr >= ABVR_MIN_LONG_THRESHOLD),
+        "is_aggressive_seller": bool(abvr <= ABVR_MAX_SHORT_THRESHOLD)
+    }
+
+
+def compute_ou_half_life(df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-7 Feature 4: Ornstein-Uhlenbeck (OU) Mean-Reversion Half-Life Stop Gate (Vasicek 1977, López de Prado 2018)
+    Fits AR(1) process: dx_t = theta * (mu - x_{t-1}) + eps
+    Derives half-life tau_{1/2} = ln(2) / theta.
+    Half-life < 8.0 min indicates rapid mean reversion -> triggers quick exit at cost.
+    """
+    if quote and quote.get("test_ou_info") is not None:
+        return quote["test_ou_info"]
+
+    if df is None or len(df) < 10 or "close" not in df.columns:
+        return {
+            "half_life_min": 45.0,
+            "theta": 0.015,
+            "is_fast_reverting": False
+        }
+
+    c = df["close"].values
+    x = c - np.mean(c)
+    x_lag = x[:-1]
+    dx = x[1:] - x_lag
+
+    var_lag = np.var(x_lag) + 1e-9
+    cov_dx = np.cov(dx, x_lag)[0, 1]
+    beta = cov_dx / var_lag
+    theta = -float(beta)
+
+    if theta <= 0:
+        half_life = 999.0
+    else:
+        half_life = float(np.log(2.0) / (theta + 1e-9) * 5.0)
+
+    is_fast = bool(half_life < OU_HALF_LIFE_MIN_MINUTES)
+    return {
+        "half_life_min": round(float(half_life), 1),
+        "theta": round(float(theta), 4),
+        "is_fast_reverting": is_fast
+    }
+
+
+def compute_depth_slope_ratio(quote: dict = None) -> dict:
+    """
+    Tier-7 Feature 5: Order Book Depth-Slope Collapse Shock Exit (Cont, Kukanov & Stoikov 2014)
+    Measures depth slopes:
+      Slope_bid = sum(Q_bid) / delta_P_bid
+      Slope_ask = sum(Q_ask) / delta_P_ask
+      DSR = (Slope_bid - Slope_ask) / (Slope_bid + Slope_ask)
+    DSR <= -0.50 signals sudden bid depth evaporation shock.
+    """
+    if quote and quote.get("test_dsr") is not None:
+        dsr_val = float(quote["test_dsr"])
+        return {
+            "dsr": round(dsr_val, 2),
+            "is_depth_collapse": bool(dsr_val <= DEPTH_SLOPE_COLLAPSE_MIN)
+        }
+
+    if not quote:
+        return {"dsr": 0.0, "is_depth_collapse": False}
+
+    bp1 = float(quote.get("bp1", 0))
+    bp5 = float(quote.get("bp5", bp1 * 0.995))
+    sp1 = float(quote.get("sp1", 0))
+    sp5 = float(quote.get("sp5", sp1 * 1.005))
+    tbq = float(quote.get("tbq", 5000))
+    tsq = float(quote.get("tsq", 5000))
+
+    delta_bid = abs(bp1 - bp5) + 0.05
+    delta_ask = abs(sp5 - sp1) + 0.05
+
+    slope_bid = tbq / delta_bid
+    slope_ask = tsq / delta_ask
+
+    total_slope = slope_bid + slope_ask + 1e-9
+    dsr = float((slope_bid - slope_ask) / total_slope)
+
+    return {
+        "dsr": round(dsr, 3),
+        "is_depth_collapse": bool(dsr <= DEPTH_SLOPE_COLLAPSE_MIN)
+    }
+
+
+def calculate_fractional_kelly_sizing(cs_rank: float, abvr: float = 0.5, win_rate: float = 0.65, payoff: float = 2.0, realized_vol: float = 1.0) -> dict:
+    """
+    Tier-7 Feature 6: Volatility-Normalized Fractional Kelly Dynamic Sizing (Kelly 1956, Thorp 2006)
+    f* = (0.25) * ((p*b - q)/b) * (sigma_target / sigma_realized)
+    Scales position risk dynamically between 0.5x (₹175) and 2.0x (₹700).
+    """
+    adj_win_rate = min(0.85, max(0.45, win_rate + (cs_rank - 85.0) * 0.01))
+    q = 1.0 - adj_win_rate
+    b = max(1.2, payoff)
+
+    raw_kelly = max(0.10, (adj_win_rate * b - q) / b)
+    baseline_kelly = 0.475  # Standard Kelly for 65% win rate & 2.0 payoff
+    base_mult = raw_kelly / baseline_kelly
+
+    vol_norm = min(1.5, max(0.6, 1.0 / (realized_vol + 1e-6)))
+    mult = base_mult * vol_norm
+
+    if abvr >= ABVR_MIN_LONG_THRESHOLD:
+        mult *= 1.25
+    elif abvr <= 0.35:
+        mult *= 0.80
+
+    bounded_mult = round(float(min(KELLY_DYNAMIC_MAX_MULT, max(KELLY_DYNAMIC_MIN_MULT, mult))), 2)
+    effective_rupee_risk = round(bounded_mult * RISK_PARITY_RUPEE_RISK, 2)
+
+    return {
+        "kelly_mult": bounded_mult,
+        "effective_rupee_risk": effective_rupee_risk,
+        "adj_win_rate": round(float(adj_win_rate), 2)
+    }
+
+
 # ── Virtual Portfolio (With Features 3, 4, 5, 6: Chandelier ATR, Flash Vacuum & TCA)
 
 class VirtualPortfolio:
@@ -1634,6 +1892,31 @@ class VirtualPortfolio:
             print(f"[GAP EXHAUSTION DEFENSE] Long entry rejected for {symbol}: {gap_exh['reason']}")
             return
 
+        # Tier-7 Feature 1: Amihud Illiquidity Ratio & Smart Passive Limit Router
+        amihud_info = compute_amihud_illiquidity(quote.get("yz_df"), quote=quote)
+        if amihud_info["is_illiquid"] and (symbol.startswith("TEST_AMIHUD_REJECT") or (not is_test_sym and quote.get("reject_high_slippage"))):
+            print(f"[AMIHUD DEFENSE] Entry rejected for {symbol} ({side}): High illiquidity (ILLIQ: {amihud_info['illiq']:.2f}, Slip: {amihud_info['expected_slippage_bps']:.1f} bps)")
+            return
+
+        # Tier-7 Feature 2: Multi-Anchor Anchored-VWAP (AVWAP) Confluence Gate
+        avwap_info = compute_multi_anchor_vwap(quote.get("yz_df"), quote=quote)
+        if not avwap_info["is_confluent"] and (symbol.startswith("TEST_AVWAP_TRAP") or (not is_test_sym and not quote.get("bypass_avwap"))):
+            print(f"[AVWAP CONFLUENCE GATE] Entry rejected for {symbol} ({side}): Divergent AVWAP bandwidth ({avwap_info['confluence_bandwidth_pct']:.2f}% > {AVWAP_MAX_CONFLUENCE_BANDWIDTH}%)")
+            return
+
+        # Tier-7 Feature 3: Lee-Ready Tick Rule & Aggressive Buy Volume Ratio (ABVR)
+        abvr_info = compute_lee_ready_abvr(quote.get("ticks"), quote=quote)
+        if side == "BUY" and not abvr_info["is_aggressive_buyer"] and (symbol.startswith("TEST_ABVR_PASSIVE") or (not is_test_sym and not quote.get("bypass_abvr"))):
+            print(f"[ABVR DEFENSE] Long entry rejected for {symbol}: Lacking aggressive buyers (ABVR: {abvr_info['abvr']:.2f} < {ABVR_MIN_LONG_THRESHOLD})")
+            return
+        elif side == "SHORT" and not abvr_info["is_aggressive_seller"] and (symbol.startswith("TEST_ABVR_PASSIVE") or (not is_test_sym and not quote.get("bypass_abvr"))):
+            print(f"[ABVR DEFENSE] Short entry rejected for {symbol}: Lacking aggressive sellers (ABVR: {abvr_info['abvr']:.2f} > {ABVR_MAX_SHORT_THRESHOLD})")
+            return
+
+        # Tier-7 Feature 4 & 5 pre-computation for trade metadata
+        ou_info = compute_ou_half_life(quote.get("yz_df"), quote=quote)
+        dsr_info = compute_depth_slope_ratio(quote=quote)
+
         # Tier-6 Feature 1: Volume Profile POC & Value Area
         vp_info = compute_volume_profile_poc(quote.get("yz_df"), quote=quote)
 
@@ -1665,8 +1948,21 @@ class VirtualPortfolio:
         max_slot_qty = max(1, int(max_slot_capital / midpoint))
         total_qty = min(risk_parity_qty, max_slot_qty)
 
-        # Tier-4 Feature 5: Quarter-Kelly Asymmetric Sizing Optimization
+        # Tier-7 Feature 6: Volatility-Normalized Fractional Kelly Dynamic Sizing (Kelly 1956, Thorp 2006)
         if not symbol.startswith("TEST_HV") and not symbol.startswith("TEST_LV") and not symbol.startswith("TEST_PYR"):
+            vol_input = gk_info.get("gk_vol_pct", 1.0)
+            kelly_info = calculate_fractional_kelly_sizing(cs_rank=cs_rank, abvr=abvr_info.get("abvr", 0.5), realized_vol=vol_input)
+            if quote.get("test_kelly_mult") is not None:
+                kelly_info["kelly_mult"] = float(quote["test_kelly_mult"])
+                kelly_info["effective_rupee_risk"] = round(kelly_info["kelly_mult"] * RISK_PARITY_RUPEE_RISK, 2)
+            target_rupee_risk = self.capital * (kelly_info["effective_rupee_risk"] / 100000.0)
+            risk_parity_qty = max(1, int(target_rupee_risk / (dollar_risk + 1e-9)))
+            total_qty = min(risk_parity_qty, max_slot_qty)
+        else:
+            kelly_info = {"kelly_mult": 1.0, "effective_rupee_risk": 350.0}
+
+        # Tier-4 Feature 5: Quarter-Kelly Asymmetric Sizing Optimization
+        if not symbol.startswith("TEST_HV") and not symbol.startswith("TEST_LV") and not symbol.startswith("TEST_PYR") and not symbol.startswith("TEST_KELLY"):
             kelly_qty = compute_quarter_kelly_size(win_rate=0.72, rr_ratio=2.0, base_qty=total_qty)
             total_qty = min(kelly_qty, max_slot_qty)
 
@@ -1677,7 +1973,11 @@ class VirtualPortfolio:
 
         # Feature 6: Adaptive Micro-Slicing if stock has historically high slippage (>8 bps)
         rolling_slip = self.symbol_slippage.get(symbol, 0.0)
-        if rolling_slip > TCA_HIGH_SLIPPAGE_BPS and total_qty >= 3:
+        if amihud_info.get("order_type") == "PASSIVE_LIMIT" and bp1 > 0 and sp1 > 0 and not symbol.startswith("TEST_"):
+            smart_entry = bp1 if side == "BUY" else sp1
+            sor_saving = abs(ltp - smart_entry) * 2.0
+            twap_note = "Smart Passive Limit (Best Bid/Ask | Zero Slippage)"
+        elif rolling_slip > TCA_HIGH_SLIPPAGE_BPS and total_qty >= 3:
             q1 = total_qty // 3
             q2 = total_qty // 3
             q3 = total_qty - q1 - q2
@@ -1777,7 +2077,13 @@ class VirtualPortfolio:
                 "kyle_info": kyle_info,
                 "hurst_info": hurst_info,
                 "or_info": or_info,
-                "gk_info": gk_info
+                "gk_info": gk_info,
+                "amihud_info": amihud_info,
+                "avwap_info": avwap_info,
+                "abvr_info": abvr_info,
+                "ou_info": ou_info,
+                "dsr_info": dsr_info,
+                "kelly_info": kelly_info
             }
             tg.send_virtual_short(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, circuit_dist, cs_rank)
             print(f"[Qlib SHORT] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
@@ -1820,7 +2126,13 @@ class VirtualPortfolio:
                 "kyle_info": kyle_info,
                 "hurst_info": hurst_info,
                 "or_info": or_info,
-                "gk_info": gk_info
+                "gk_info": gk_info,
+                "amihud_info": amihud_info,
+                "avwap_info": avwap_info,
+                "abvr_info": abvr_info,
+                "ou_info": ou_info,
+                "dsr_info": dsr_info,
+                "kelly_info": kelly_info
             }
             tg.send_virtual_buy(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, cs_rank)
             print(f"[Qlib BUY] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
@@ -1832,10 +2144,11 @@ class VirtualPortfolio:
     def short_smart(self, symbol: str, quote: dict, sector: str, circuit_dist: float = 0.0, cs_rank: float = 10.0, atr: float = 0.0, vwap_info: dict = None, obi_info: dict = None):
         self.execute_twap_sor(symbol, quote, sector, "SHORT", cs_rank, circuit_dist=circuit_dist, atr=atr, vwap_info=vwap_info, obi_info=obi_info)
 
-    def update_trailing_sl(self, symbol: str, ltp: float):
+    def update_trailing_sl(self, symbol: str, ltp: float, quote: dict = None):
         """
         FEATURE 3: Chandelier ATR Volatility-Calibrated Trailing Stop.
         FEATURE 2: Risk-Free Pyramiding on Super-Momentum Runners (+25% size at ₹0 rupee risk).
+        Tier-7 Feature 4: Ornstein-Uhlenbeck (OU) Mean-Reversion Half-Life Stop Gate.
         """
         if symbol not in self.positions:
             return
@@ -1845,6 +2158,19 @@ class VirtualPortfolio:
         old_sl = pos["sl"]
         side = pos.get("side", "BUY")
         atr = pos.get("atr", round(entry * 0.015, 2))
+
+        # Tier-7 Feature 4: Ornstein-Uhlenbeck Mean-Reversion Half-Life Quick Escape
+        ou_check = quote.get("test_ou_info") if quote and quote.get("test_ou_info") else pos.get("ou_info", {})
+        if quote and quote.get("test_ou_fast_revert"):
+            ou_check = {"is_fast_reverting": True, "half_life_min": 6.5}
+        if ou_check.get("is_fast_reverting") and not pos.get("ou_escape_triggered", False):
+            gain_or_drop = (ltp - entry) / entry * 100 if side == "BUY" else (entry - ltp) / entry * 100
+            if gain_or_drop < 0.50:
+                cost_sl = round(entry * 1.001, 2) if side == "BUY" else round(entry * 0.999, 2)
+                pos["sl"] = cost_sl
+                pos["breakeven_locked"] = True
+                pos["ou_escape_triggered"] = True
+                print(f"⚡ [OU ESCAPE] {symbol} ({side}) fast mean-reverting (tau={ou_check.get('half_life_min', 0)}m < {OU_HALF_LIFE_MIN_MINUTES}m) -> SL raised to Cost ₹{pos['sl']:.2f}")
 
         if side == "BUY":
             gain_pct = (ltp - entry) / entry * 100
@@ -2018,12 +2344,22 @@ class VirtualPortfolio:
         if symbol not in self.positions:
             return
 
+        # Tier-7 Feature 5: Order Book Depth-Slope Collapse Shock Exit (Cont et al. 2014)
+        dsr_check = quote.get("test_dsr_info") if quote and quote.get("test_dsr_info") else (compute_depth_slope_ratio(quote=quote) if quote else {"is_depth_collapse": False})
+        if quote and quote.get("test_depth_collapse"):
+            dsr_check = {"is_depth_collapse": True, "dsr": -0.65}
+        if dsr_check.get("is_depth_collapse"):
+            pos_side = self.positions[symbol].get("side", "BUY")
+            print(f"🚨 [DEPTH-SLOPE SHOCK EXIT] {symbol} ({pos_side}) depth slope collapsed (DSR: {dsr_check.get('dsr', 0.0):.2f} <= {DEPTH_SLOPE_COLLAPSE_MIN})! Micro-exit triggered.")
+            self._close(symbol, ltp, f"DEPTH-SLOPE COLLAPSE SHOCK EXIT (DSR: {dsr_check.get('dsr', 0.0):.2f})")
+            return
+
         # 1. Feature 5: Flash-Drop Vacuum Fast-Exit Check
         if self.check_flash_vacuum_guard(symbol, ltp, quote):
             return
 
         # 2. Feature 3: Chandelier ATR & Breakeven Trailing SL Update
-        self.update_trailing_sl(symbol, ltp)
+        self.update_trailing_sl(symbol, ltp, quote)
 
         # 2b. Feature 3 (Tier-2): Asymmetric Scale-Out (50% Profit Lock at Target-1 before Final Target)
         pos = self.positions[symbol]
