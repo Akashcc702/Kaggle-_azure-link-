@@ -1037,9 +1037,152 @@ def test_azure_intraday_tier5_nextgen_features():
 
     print("  ✅ All 6 Next-Gen (Tier-5) Features verified: Pre-Close 15:08 TWAP Exit | CFR Order Book Spoof Radar | Bollinger-VWAP 1.3x Sizer | Moskowitz-Grinblatt Sector Confluence | Spread Shock Absorber | Parabolic Chandelier Ratchet (0.5x ATR @ +4%) = 100% PERFECT!")
 
+def test_azure_intraday_tier6_nextlevel_features():
+    print("[TEST 35/35] Testing 6 Tier-6 Next-Level Institutional Profit-Doubler Quant Features...")
+    from smallcap_intraday_engine import (
+        compute_volume_profile_poc,
+        compute_kyles_lambda,
+        compute_hurst_exponent,
+        check_opening_range_acceptance,
+        compute_garman_klass_volatility,
+        check_gap_exhaustion,
+        VirtualPortfolio,
+        VP_VALUE_AREA_PCT,
+        KYLE_LAMBDA_ABSORPTION_THRESHOLD,
+        KYLE_LAMBDA_PHANTOM_THRESHOLD,
+        HURST_TREND_MIN,
+        HURST_CHOP_MAX,
+        HURST_CHOP_MIN,
+        ORB_MIN_VOLUME_MULT,
+        GK_VOL_TARGET_MULT,
+        GAP_EXHAUSTION_PCT,
+    )
+
+    # 1. Feature 1: Volume Profile POC & Value Area (Steidlmayer 1986 / CME)
+    c_vp = np.array([98.0, 99.0, 100.0, 100.0, 100.0, 100.0, 100.2, 101.0, 102.0])
+    v_vp = np.array([1000, 2000, 25000, 30000, 28000, 20000, 15000, 3000, 1000])
+    df_vp = pd.DataFrame({"close": c_vp, "volume": v_vp, "high": c_vp + 0.2, "low": c_vp - 0.2})
+    vp_res = compute_volume_profile_poc(df_vp, quote={"lp": 100.0})
+    assert vp_res["poc"] >= 99.0 and vp_res["poc"] <= 101.0
+    assert vp_res["vah"] >= vp_res["poc"]
+    assert vp_res["val"] <= vp_res["poc"]
+    assert vp_res["in_value_area"] is True
+
+    # 2. Feature 2: Kyle's Lambda (λ) & Hasbrouck Order Flow Meter
+    # Absorption: High volume + tiny price change
+    c_abs = np.array([100.0, 100.01, 100.02, 100.0, 100.01])
+    o_abs = np.array([100.0, 100.01, 100.01, 100.0, 100.01])
+    v_abs = np.array([5000, 5000, 5000, 5000, 500000])
+    df_abs = pd.DataFrame({"close": c_abs, "open": o_abs, "volume": v_abs})
+    kyle_abs = compute_kyles_lambda(df_abs)
+    assert kyle_abs["is_absorption"] is True
+    assert kyle_abs["lambda"] <= KYLE_LAMBDA_ABSORPTION_THRESHOLD
+
+    # Phantom pump: Low volume + huge price jump
+    quote_phantom = {
+        "lp": 105.0, "bp1": 104.8, "sp1": 105.2, "tbq": 500, "tsq": 500,
+        "test_kyle": {"lambda": 0.08, "is_absorption": False, "is_phantom": True, "status": "PHANTOM_LIQUIDITY"}
+    }
+    port_phantom = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_phantom.execute_twap_sor("TEST_KYLE_PHANTOM", quote_phantom, "Metals", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_KYLE_PHANTOM" not in port_phantom.positions
+
+    # 3. Feature 3: Multi-Timeframe Fractal Hurst Exponent Regime Filter
+    quote_chop = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_hurst": 0.49
+    }
+    h_res = compute_hurst_exponent(quote=quote_chop)
+    assert h_res["is_chop"] is True
+    assert h_res["regime"] == "RANDOM_WALK_CHOP"
+
+    port_chop = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_chop.execute_twap_sor("TEST_HURST_CHOP", quote_chop, "Tech", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_HURST_CHOP" not in port_chop.positions
+
+    # Trending persistence
+    quote_trend = {"test_hurst": 0.65}
+    h_trend = compute_hurst_exponent(quote=quote_trend)
+    assert h_trend["is_chop"] is False
+    assert h_trend["regime"] == "TRENDING_PERSISTENT"
+
+    # 4. Feature 4: Dalton's Opening Range Breakout Acceptance & Fake-Drive Guard
+    # Fake drive: spikes high but closes inside OR range
+    df_fake = pd.DataFrame({
+        "high": [100.5, 100.8, 100.2, 102.0],
+        "low": [99.5, 99.8, 99.4, 99.8],
+        "close": [100.0, 100.4, 100.1, 100.2],  # OR high was 100.8, bar 4 closed at 100.2
+        "volume": [10000, 12000, 11000, 9000]
+    })
+    or_fake = check_opening_range_acceptance("FAKE_STK", "BUY", df=df_fake)
+    assert or_fake["is_fake_drive"] is True
+    assert or_fake["accepted"] is False
+
+    port_or = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_or_fake = {
+        "lp": 100.2, "bp1": 100.1, "sp1": 100.3, "tbq": 50000, "tsq": 50000,
+        "test_or_info": or_fake
+    }
+    port_or.execute_twap_sor("TEST_OR_FAKE", quote_or_fake, "Power", "BUY", cs_rank=92.0, bypass_window=True)
+    assert "TEST_OR_FAKE" not in port_or.positions
+
+    # 5. Feature 5: Garman-Klass Extreme-Range Realized Volatility Dynamic Target Tuning
+    df_gk = pd.DataFrame({
+        "high": [102.0, 103.5, 104.0, 103.8, 105.0],
+        "low": [98.0, 99.0, 100.0, 99.5, 101.0],
+        "open": [99.0, 100.0, 101.0, 100.0, 102.0],
+        "close": [101.5, 103.0, 103.2, 102.5, 104.5]
+    })
+    gk_res = compute_garman_klass_volatility(df_gk)
+    assert gk_res["gk_vol_pct"] > 0
+    assert 1.5 <= gk_res["dynamic_target_pct"] <= 4.5
+
+    port_gk = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_gk = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_gk_vol": 1.80
+    }
+    port_gk.execute_twap_sor("TEST_GK_VOL", quote_gk, "Chemicals", "BUY", cs_rank=90.0, bypass_window=True)
+    assert "TEST_GK_VOL" in port_gk.positions
+    pos_gk = port_gk.positions["TEST_GK_VOL"]
+    # 100.0 * (1 + 3.96 / 100) = 103.96
+    assert pos_gk["target"] == 103.96
+    assert "gk_info" in pos_gk
+    assert pos_gk["gk_info"]["dynamic_target_pct"] == 3.96
+
+    # 6. Feature 6: Cross-Market Pre-Market Lead-Lag Cointegration & Gap Exhaustion Defense
+    quote_gap_exh = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_gap_exhaustion": True, "test_nifty_gap": 0.85
+    }
+    gap_res = check_gap_exhaustion(quote=quote_gap_exh)
+    assert gap_res["gap_exhaustion"] is True
+    assert gap_res["nifty_gap_pct"] == 0.85
+
+    port_gap = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_gap.execute_twap_sor("TEST_GAP_EXH", quote_gap_exh, "FMCG", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_GAP_EXH" not in port_gap.positions
+
+    # Normal gap: Allowed
+    quote_normal_gap = {"test_gap_exhaustion": False, "test_nifty_gap": 0.25}
+    assert check_gap_exhaustion(quote=quote_normal_gap)["gap_exhaustion"] is False
+
+    # 7. Metadata Verification on Active Trade
+    quote_full = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000}
+    port_full = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_full.execute_twap_sor("TEST_FULL_METADATA", quote_full, "Auto", "BUY", cs_rank=92.0, bypass_window=True)
+    pos_f = port_full.positions["TEST_FULL_METADATA"]
+    assert "vp_info" in pos_f
+    assert "kyle_info" in pos_f
+    assert "hurst_info" in pos_f
+    assert "or_info" in pos_f
+    assert "gk_info" in pos_f
+
+    print("  ✅ All 6 Tier-6 Features verified: Volume Profile POC & VA | Kyle's Lambda Absorption Meter | Fractal Hurst Chop Filter | Dalton OR Fake-Drive Guard | Garman-Klass Dynamic Target | Gap Exhaustion Defense = 100% PERFECT!")
+
 if __name__ == "__main__":
     print("=" * 68)
-    print("  RUNNING CC ALGOTRADING v4.0 (34-TEST INSTITUTIONAL SUITE)")
+    print("  RUNNING CC ALGOTRADING v4.5 (35-TEST INSTITUTIONAL SUITE)")
     print("=" * 68)
     test_micro_alpha30()
     test_cs_rank()
@@ -1075,8 +1218,9 @@ if __name__ == "__main__":
     test_profit_doubler_advanced_features()
     test_azure_intraday_6_profit_doubler_features()
     test_azure_intraday_tier5_nextgen_features()
+    test_azure_intraday_tier6_nextlevel_features()
     print("=" * 68)
-    print("  🎉 ALL 34 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
+    print("  🎉 ALL 35 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 68)
 
 
