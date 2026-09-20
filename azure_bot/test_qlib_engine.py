@@ -761,9 +761,147 @@ def test_profit_doubler_advanced_features():
 
     print(f"  ✅ 5 Advanced Profit-Doubler Features verified: Golden Windows (09:18-10:45 / 13:15-14:45) | CVD Absorption Score={cvd_acc['absorption_score']:+.2f} | Risk-Parity ({pos_hv['qty']} vs {pos_lv['qty']} shares) | Squeeze Target={pos_sq['target']} (+{SQUEEZE_TARGET_PCT}%) | Risk-Free Pyramiding (+{expected_add} shares @ ₹0 Risk) = 100% PERFECT!")
 
+def test_azure_intraday_6_profit_doubler_features():
+    print("[TEST 33/33] Testing 6 Advanced Profit-Doubling Features (Azure Intraday Engine)...")
+    import time
+    from smallcap_intraday_engine import (
+        compute_5level_micro_imbalance,
+        compute_vpin_toxicity,
+        check_nifty_lead_lag_surge,
+        compute_yang_zhang_volatility,
+        compute_quarter_kelly_size,
+        MICRO_IMBALANCE_MIN_LONG,
+        MICRO_IMBALANCE_REJECT_LONG,
+        VPIN_TOXIC_THRESHOLD,
+        YANG_ZHANG_EXPANDED_TGT,
+        YANG_ZHANG_COMPRESSED_TGT,
+        TIME_STOP_MAX_MINUTES,
+        TIME_STOP_FLAT_MIN_PCT,
+        TIME_STOP_FLAT_MAX_PCT,
+    )
+
+    # 1. Feature 1: 5-Level Weighted Order Book Micro-Imbalance Engine
+    quote_strong_bid = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1,
+        "bq1": 15000, "bq2": 12000, "bq3": 10000, "bq4": 8000, "bq5": 6000,
+        "sq1": 2000, "sq2": 1500, "sq3": 1000, "sq4": 800, "sq5": 500,
+        "tbq": 51000, "tsq": 5800
+    }
+    imb_strong = compute_5level_micro_imbalance(quote_strong_bid)
+    assert imb_strong["valid_long"] is True
+    assert imb_strong["confirmed_long"] is True
+    assert imb_strong["imbalance"] >= MICRO_IMBALANCE_MIN_LONG
+
+    quote_heavy_ask = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1,
+        "bq1": 1000, "bq2": 800, "bq3": 500, "bq4": 300, "bq5": 200,
+        "sq1": 15000, "sq2": 12000, "sq3": 10000, "sq4": 8000, "sq5": 6000,
+        "tbq": 2800, "tsq": 51000
+    }
+    imb_trap = compute_5level_micro_imbalance(quote_heavy_ask)
+    assert imb_trap["valid_long"] is False
+    assert imb_trap["imbalance"] < MICRO_IMBALANCE_REJECT_LONG
+
+    # Test rejection of imbalance trap in SOR execution
+    port = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port.execute_twap_sor("TEST_IMB_TRAP", quote_heavy_ask, "Metals", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_IMB_TRAP" not in port.positions
+
+    # 2. Feature 2: VPIN Flash-Crash Toxicity Defense
+    quote_toxic = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000, "test_vpin": 0.78}
+    vpin_toxic = compute_vpin_toxicity(quote_toxic)
+    assert vpin_toxic["is_toxic"] is True
+    assert vpin_toxic["vpin"] >= VPIN_TOXIC_THRESHOLD
+    assert vpin_toxic["regime"] == "TOXIC_REGIME"
+
+    quote_healthy = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000, "test_vpin": 0.22}
+    vpin_healthy = compute_vpin_toxicity(quote_healthy)
+    assert vpin_healthy["is_toxic"] is False
+    assert vpin_healthy["regime"] == "HEALTHY_FLOW"
+
+    # Test execution blocks buy under toxic flow
+    port.execute_twap_sor("TEST_VPIN_TRAP", quote_toxic, "IT", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_VPIN_TRAP" not in port.positions
+
+    # 3. Feature 3: Lead-Lag Nifty 50 Beta-Catchup Momentum Surge
+    ll_res = check_nifty_lead_lag_surge(nifty_pct=0.35, stock_5m_pct=0.10)
+    assert ll_res["surge_alpha"] is True
+    assert ll_res["boost_target"] == 1.2
+
+    ll_res_no = check_nifty_lead_lag_surge(nifty_pct=0.08, stock_5m_pct=0.10)
+    assert ll_res_no["surge_alpha"] is False
+
+    # Lead-lag in execution expands target
+    quote_ll = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 60000, "tsq": 40000,
+        "nifty_5m_pct": 0.35, "stock_5m_pct": 0.10
+    }
+    port.execute_twap_sor("TEST_LEADLAG", quote_ll, "Auto", "BUY", cs_rank=88.0, bypass_window=True)
+    pos_ll = port.positions["TEST_LEADLAG"]
+    assert pos_ll["lead_lag_active"] is True
+    assert pos_ll["target"] >= 103.60
+
+    # 4. Feature 4: Yang-Zhang Micro-Volatility Target Tuning
+    dates = pd.date_range("2026-09-21 09:15", periods=25, freq="5min")
+    df_high = pd.DataFrame({
+        "open": np.linspace(100, 115, 25),
+        "high": np.linspace(104, 120, 25),
+        "low": np.linspace(98, 112, 25),
+        "close": np.linspace(103, 118, 25),
+        "volume": [100000] * 25
+    }, index=dates)
+    yz_high = compute_yang_zhang_volatility(df_high)
+    assert yz_high["vol_regime"] == "EXPANDING_VOLATILITY"
+    assert yz_high["dynamic_target"] == YANG_ZHANG_EXPANDED_TGT
+
+    df_low = pd.DataFrame({
+        "open": [100.0 + i * 0.01 for i in range(25)],
+        "high": [100.03 + i * 0.01 for i in range(25)],
+        "low": [99.98 + i * 0.01 for i in range(25)],
+        "close": [100.01 + i * 0.01 for i in range(25)],
+        "volume": [100000] * 25
+    }, index=dates)
+    yz_low = compute_yang_zhang_volatility(df_low)
+    assert yz_low["vol_regime"] == "COMPRESSED_VOLATILITY"
+    assert yz_low["dynamic_target"] == YANG_ZHANG_COMPRESSED_TGT
+
+    # 5. Feature 5: Quarter-Kelly Asymmetric Sizing
+    base_qty = 20
+    q_kelly_high = compute_quarter_kelly_size(win_rate=0.75, rr_ratio=2.0, base_qty=base_qty)
+    assert q_kelly_high >= base_qty
+    q_kelly_low = compute_quarter_kelly_size(win_rate=0.35, rr_ratio=1.0, base_qty=base_qty)
+    assert q_kelly_low <= base_qty
+
+    # 6. Feature 6: 35-Minute Dead-Capital Time-Stop
+    port_ts = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    entry_ts = time.time() - (40 * 60)
+    quote_ts = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_entry_time": entry_ts
+    }
+    port_ts.execute_twap_sor("TEST_TIMESTOP", quote_ts, "Finance", "BUY", cs_rank=90.0, bypass_window=True)
+    assert "TEST_TIMESTOP" in port_ts.positions
+
+    # Flat P&L (+0.2%) after 40 minutes -> triggers 35-minute time-stop exit
+    port_ts.check_and_exit("TEST_TIMESTOP", ltp=100.20)
+    assert "TEST_TIMESTOP" not in port_ts.positions
+    closed = port_ts.closed_trades[-1]
+    assert "35-MIN DEAD CAPITAL TIME-STOP" in closed["reason"]
+
+    # Active runner (+1.8%) after 40 minutes is NOT closed by time-stop
+    quote_runner = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_entry_time": entry_ts
+    }
+    port_ts.execute_twap_sor("TEST_RUNNER", quote_runner, "Infra", "BUY", cs_rank=90.0, bypass_window=True)
+    port_ts.check_and_exit("TEST_RUNNER", ltp=101.80)
+    assert "TEST_RUNNER" in port_ts.positions
+
+    print("  ✅ All 6 Profit-Doubler Features verified: 5-Level Micro-Imbalance | VPIN Toxicity Defense | Lead-Lag Beta Catchup | Yang-Zhang Vol Target | Quarter-Kelly Sizing | 35-Min Dead-Capital Time-Stop = 100% PERFECT!")
+
 if __name__ == "__main__":
     print("=" * 68)
-    print("  RUNNING CC ALGOTRADING v3.9 (32-TEST INSTITUTIONAL SUITE)")
+    print("  RUNNING CC ALGOTRADING v3.9 (33-TEST INSTITUTIONAL SUITE)")
     print("=" * 68)
     test_micro_alpha30()
     test_cs_rank()
@@ -797,8 +935,9 @@ if __name__ == "__main__":
     test_kaggle_gpu_deployment_and_weights()
     test_shoonya_eod_data_extraction_and_parquet()
     test_profit_doubler_advanced_features()
+    test_azure_intraday_6_profit_doubler_features()
     print("=" * 68)
-    print("  🎉 ALL 32 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
+    print("  🎉 ALL 33 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 68)
 
 
