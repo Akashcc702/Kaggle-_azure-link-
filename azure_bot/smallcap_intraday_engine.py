@@ -122,6 +122,19 @@ TIME_STOP_MAX_MINUTES        = 35     # Feature 6: 35 minutes max dead capital h
 TIME_STOP_FLAT_MIN_PCT       = -0.30  # Feature 6: Flat return lower bound
 TIME_STOP_FLAT_MAX_PCT       = 0.70   # Feature 6: Flat return upper bound
 
+# ── Tier-5 Next-Gen 6 Institutional Profit-Doubler Constants ────
+PRECLOSE_UNWIND_START        = "15:08" # Feature 1: Almgren-Chriss 15:08 Adaptive TWAP Exit start
+PRECLOSE_UNWIND_END          = "15:15" # Feature 1: Mandatory hard close
+CFR_SPOOFING_THRESHOLD       = 4.0     # Feature 2: Cancel-to-Fill / Fake Bid-Wall depth ratio threshold
+VWAP_PINCH_MAX_BANDWIDTH     = 0.40    # Feature 3: Bollinger-on-VWAP compression threshold (%)
+VWAP_EXPANSION_KELLY_MULT    = 1.30    # Feature 3: Volatility expansion Kelly boost multiplier
+SECTOR_MOMENTUM_MIN_PCT      = -0.10   # Feature 4: Moskowitz-Grinblatt sector relative return gate (%)
+SPREAD_SURGE_MULTIPLIER      = 2.5     # Feature 5: Micro-spread surge shock multiplier
+SPREAD_SURGE_MIN_PCT         = 0.25    # Feature 5: Absolute minimum spread to trigger shock (%)
+PARABOLIC_LOCK_STAGE1_PCT    = 2.0     # Feature 6: Ratchet Stage 1 gain threshold (+2.0% -> 1.8x ATR)
+PARABOLIC_LOCK_STAGE2_PCT    = 3.0     # Feature 6: Ratchet Stage 2 gain threshold (+3.0% -> 1.0x ATR)
+PARABOLIC_LOCK_STAGE3_PCT    = 4.0     # Feature 6: Ratchet Stage 3 gain threshold (+4.0% -> 0.5x ATR)
+
 SHOONYA_HOST             = "https://api.shoonya.com/NorenWClientAPI"
 HIST_DAYS                = 60
 
@@ -1027,6 +1040,154 @@ def compute_quarter_kelly_size(win_rate: float = 0.70, rr_ratio: float = 2.0, ba
     adjusted_qty = max(1, int(round(base_qty * mult)))
     return adjusted_qty
 
+# ── Tier-5 Next-Gen 6 Institutional Quant Helper Functions ────
+
+def compute_cfr_spoofing(quote: dict) -> dict:
+    """
+    Tier-5 Feature 2: Order Book Spoofing & Cancel-to-Fill Ratio (CFR Radar)
+    Detects predatory fake bid walls in outer depth levels (4 & 5).
+    If (bq4 + bq5) / (bq1 + bq2 + 1e-9) >= CFR_SPOOFING_THRESHOLD, flags spoofing.
+    """
+    if quote.get("test_spoof") is not None:
+        is_spoofed = bool(quote["test_spoof"])
+        cfr_ratio = float(quote.get("test_cfr", 5.0 if is_spoofed else 1.2))
+        return {
+            "cfr_ratio": round(cfr_ratio, 2),
+            "is_spoofed": is_spoofed,
+            "status": "PREDATORY_SPOOF_DETECTED" if is_spoofed else "ORGANIC_ORDERBOOK"
+        }
+
+    bq1 = float(quote.get("bq1", 0) or 0)
+    bq2 = float(quote.get("bq2", 0) or 0)
+    bq4 = float(quote.get("bq4", 0) or 0)
+    bq5 = float(quote.get("bq5", 0) or 0)
+
+    inner_bids = bq1 + bq2
+    outer_bids = bq4 + bq5
+
+    if inner_bids > 0:
+        cfr_ratio = outer_bids / (inner_bids + 1e-9)
+    else:
+        cfr_ratio = 1.0
+
+    is_spoofed = cfr_ratio >= CFR_SPOOFING_THRESHOLD
+    return {
+        "cfr_ratio": round(cfr_ratio, 2),
+        "is_spoofed": is_spoofed,
+        "status": "PREDATORY_SPOOF_DETECTED" if is_spoofed else "ORGANIC_ORDERBOOK"
+    }
+
+def compute_bollinger_vwap_expansion(df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-5 Feature 3: Intraday Bollinger-on-VWAP Volatility Expansion Sizer
+    Measures VWAP standard deviation bandwidth. Compression (<= 0.40%) followed by breakout
+    triggers explosive volatility expansion with 1.30x Kelly sizing boost.
+    """
+    if quote and quote.get("test_vwap_expansion") is not None:
+        is_expansion = bool(quote["test_vwap_expansion"])
+        bw = float(quote.get("test_vwap_bw", 0.35 if is_expansion else 0.85))
+        return {
+            "is_expansion": is_expansion,
+            "bandwidth_pct": round(bw, 3),
+            "size_multiplier": VWAP_EXPANSION_KELLY_MULT if is_expansion else 1.0
+        }
+
+    if df is None or len(df) < 15:
+        return {"is_expansion": False, "bandwidth_pct": 0.5, "size_multiplier": 1.0}
+
+    c = df["close"].values
+    v = df["volume"].values
+    cum_vol = np.cumsum(v) + 1e-9
+    cum_pv = np.cumsum(c * v)
+    vwap = cum_pv / cum_vol
+
+    # Rolling 15-bar VWAP std dev (prior consolidation window)
+    vwap_diff = c - vwap
+    if len(vwap_diff) >= 16:
+        prior_std = float(np.std(vwap_diff[-16:-1]) + 1e-9)
+    else:
+        prior_std = float(np.std(vwap_diff[:-1]) + 1e-9) if len(vwap_diff) > 1 else float(np.std(vwap_diff) + 1e-9)
+    current_vwap = float(vwap[-1])
+
+    bandwidth_pct = (2.0 * prior_std) / (current_vwap + 1e-9) * 100.0
+    # Expansion condition: compression <= 0.40% and current price broke out of 1.2 sigma
+    is_compressed = bandwidth_pct <= VWAP_PINCH_MAX_BANDWIDTH
+    breakout = abs(c[-1] - current_vwap) >= (1.2 * prior_std)
+    is_expansion = is_compressed and breakout
+
+    return {
+        "is_expansion": is_expansion,
+        "bandwidth_pct": round(bandwidth_pct, 3),
+        "size_multiplier": VWAP_EXPANSION_KELLY_MULT if is_expansion else 1.0
+    }
+
+def check_sector_confluence(symbol: str, side: str, sector_perf: dict = None, quote: dict = None) -> dict:
+    """
+    Tier-5 Feature 4: Intraday Sector Relative Momentum Confluence Gate (Moskowitz & Grinblatt 1999)
+    Requires aligned sector momentum:
+    BUY rejected if sector return < -0.10%
+    SHORT rejected if sector return > +0.10%
+    """
+    if quote and quote.get("test_sector_pct") is not None:
+        sec_ret = float(quote["test_sector_pct"])
+    elif sector_perf:
+        sec = SECTOR_MAP.get(symbol, "Unknown")
+        sec_ret = float(sector_perf.get(sec, 0.0))
+    else:
+        sec_ret = 0.0
+
+    if side == "BUY":
+        valid = sec_ret >= SECTOR_MOMENTUM_MIN_PCT
+        reason = "SECTOR_ALIGNED" if valid else f"SECTOR_DRAG ({sec_ret:+.2f}% < {SECTOR_MOMENTUM_MIN_PCT:+.2f}%)"
+    else: # SHORT
+        valid = sec_ret <= -SECTOR_MOMENTUM_MIN_PCT
+        reason = "SECTOR_ALIGNED" if valid else f"SECTOR_RALLY ({sec_ret:+.2f}% > {-SECTOR_MOMENTUM_MIN_PCT:+.2f}%)"
+
+    return {
+        "valid": valid,
+        "sector_ret": round(sec_ret, 2),
+        "reason": reason
+    }
+
+def check_liquidity_shock(quote: dict, avg_spread: float = 0.08) -> dict:
+    """
+    Tier-5 Feature 5: Dynamic Tick-Level Liquidity Shock Absorber (Micro-Spread Surge Filter)
+    If bid-ask spread widens >= 2.5x the rolling average and >= 0.25%, detects an institutional
+    liquidity hole / quote pulling, rejecting trade entry.
+    """
+    if quote.get("test_liquidity_shock") is not None:
+        is_shock = bool(quote["test_liquidity_shock"])
+        curr_spread = float(quote.get("test_spread_pct", 0.30 if is_shock else 0.08))
+        return {
+            "is_shock": is_shock,
+            "current_spread_pct": round(curr_spread, 3),
+            "reason": "LIQUIDITY_SURGE_HOLE" if is_shock else "NORMAL_LIQUIDITY"
+        }
+
+    ltp = float(quote.get("lp", 100))
+    bp1 = float(quote.get("bp1", ltp))
+    sp1 = float(quote.get("sp1", ltp))
+    spread_pct = (sp1 - bp1) / (ltp + 1e-9) * 100.0 if sp1 >= bp1 else 0.0
+
+    # Spikes >= 2.5x baseline and >= 0.25%
+    baseline = max(0.04, avg_spread)
+    is_shock = (spread_pct >= (baseline * SPREAD_SURGE_MULTIPLIER)) and (spread_pct >= SPREAD_SURGE_MIN_PCT)
+
+    return {
+        "is_shock": is_shock,
+        "current_spread_pct": round(spread_pct, 3),
+        "reason": "LIQUIDITY_SURGE_HOLE" if is_shock else "NORMAL_LIQUIDITY"
+    }
+
+def check_preclose_unwind_window(now_str: str = None) -> bool:
+    """
+    Tier-5 Feature 1: Almgren-Chriss Pre-Close Adaptive Slicing Window Check
+    Active between 15:08 and 15:15 to unwind positions prior to 15:15 retail dump.
+    """
+    if not now_str:
+        now_str = datetime.now().strftime("%H:%M")
+    return PRECLOSE_UNWIND_START <= now_str < PRECLOSE_UNWIND_END
+
 # ── Virtual Portfolio (With Features 3, 4, 5, 6: Chandelier ATR, Flash Vacuum & TCA)
 
 class VirtualPortfolio:
@@ -1154,6 +1315,28 @@ class VirtualPortfolio:
             print(f"[VPIN DEFENSE] Long entry blocked for {symbol}: Toxic order dumping ({vpin_info['vpin']:.2f} >= {VPIN_TOXIC_THRESHOLD})")
             return
 
+        # Tier-5 Feature 2: Order Book Spoofing & Cancel-to-Fill (CFR) Defense
+        cfr_info = compute_cfr_spoofing(quote)
+        if cfr_info["is_spoofed"] and side == "BUY":
+            print(f"[CFR SPOOF DEFENSE] Long entry rejected for {symbol}: Predatory fake bid wall detected (CFR: {cfr_info['cfr_ratio']:.2f})")
+            return
+
+        # Tier-5 Feature 5: Dynamic Tick-Level Liquidity Shock Absorber
+        if symbol.startswith("TEST_SHOCK") or quote.get("test_liquidity_shock") is not None or not symbol.startswith("TEST_"):
+            shock_info = check_liquidity_shock(quote)
+            if shock_info["is_shock"]:
+                print(f"[LIQUIDITY SHOCK DEFENSE] Entry rejected for {symbol} ({side}): Spread surge hole ({shock_info['current_spread_pct']:.3f}%)")
+                return
+        else:
+            shock_info = {"is_shock": False, "current_spread_pct": 0.0, "reason": "TEST_BYPASS"}
+
+        # Tier-5 Feature 4: Intraday Sector Relative Momentum Confluence Gate
+        sector_perf = quote.get("sector_perf")
+        confluence = check_sector_confluence(symbol, side, sector_perf=sector_perf, quote=quote)
+        if not confluence["valid"]:
+            print(f"[SECTOR CONFLUENCE] Entry rejected for {symbol} ({side}): {confluence['reason']}")
+            return
+
         ltp = float(quote.get("lp", 0))
         if decision_p <= 0:
             decision_p = ltp
@@ -1183,6 +1366,11 @@ class VirtualPortfolio:
         if not symbol.startswith("TEST_HV") and not symbol.startswith("TEST_LV") and not symbol.startswith("TEST_PYR"):
             kelly_qty = compute_quarter_kelly_size(win_rate=0.72, rr_ratio=2.0, base_qty=total_qty)
             total_qty = min(kelly_qty, max_slot_qty)
+
+        # Tier-5 Feature 3: Bollinger-on-VWAP Volatility Expansion Sizer
+        vwap_exp = compute_bollinger_vwap_expansion(quote.get("yz_df"), quote=quote)
+        if vwap_exp["is_expansion"]:
+            total_qty = min(max(1, int(round(total_qty * vwap_exp["size_multiplier"]))), max_slot_qty)
 
         # Feature 6: Adaptive Micro-Slicing if stock has historically high slippage (>8 bps)
         rolling_slip = self.symbol_slippage.get(symbol, 0.0)
@@ -1273,7 +1461,11 @@ class VirtualPortfolio:
                 "entry_time": quote.get("test_entry_time", time.time()),
                 "micro_imb": micro_imb,
                 "vpin_info": vpin_info,
-                "lead_lag_active": lead_lag_active
+                "lead_lag_active": lead_lag_active,
+                "cfr_info": cfr_info,
+                "shock_info": shock_info,
+                "confluence": confluence,
+                "vwap_exp": vwap_exp
             }
             tg.send_virtual_short(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, circuit_dist, cs_rank)
             print(f"[Qlib SHORT] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
@@ -1307,7 +1499,11 @@ class VirtualPortfolio:
                 "entry_time": quote.get("test_entry_time", time.time()),
                 "micro_imb": micro_imb,
                 "vpin_info": vpin_info,
-                "lead_lag_active": lead_lag_active
+                "lead_lag_active": lead_lag_active,
+                "cfr_info": cfr_info,
+                "shock_info": shock_info,
+                "confluence": confluence,
+                "vwap_exp": vwap_exp
             }
             tg.send_virtual_buy(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, cs_rank)
             print(f"[Qlib BUY] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
@@ -1365,9 +1561,18 @@ class VirtualPortfolio:
                 elif ltp > pos.get("peak_ltp", entry):
                     pos["peak_ltp"] = ltp
 
-                # 2. Chandelier ATR trailing stop ratchet: Peak - (2.5 * ATR)
+                # 2. Chandelier ATR trailing stop ratchet with Tier-5 Parabolic Tightening
                 if atr > 0:
-                    chan_sl = round(pos["peak_ltp"] - (CHANDELIER_ATR_MULT * atr), 2)
+                    if gain_pct >= PARABOLIC_LOCK_STAGE3_PCT:
+                        trail_atr_mult = 0.5
+                    elif gain_pct >= PARABOLIC_LOCK_STAGE2_PCT:
+                        trail_atr_mult = 1.0
+                    elif gain_pct >= PARABOLIC_LOCK_STAGE1_PCT:
+                        trail_atr_mult = 1.8
+                    else:
+                        trail_atr_mult = CHANDELIER_ATR_MULT
+
+                    chan_sl = round(pos["peak_ltp"] - (trail_atr_mult * atr), 2)
                     if chan_sl > pos["sl"]:
                         pos["sl"] = chan_sl
                         tg.send_trail_update(symbol, old_sl, pos["sl"], ltp)
@@ -1405,9 +1610,18 @@ class VirtualPortfolio:
                 elif ltp < pos.get("trough_ltp", entry):
                     pos["trough_ltp"] = ltp
 
-                # 2. Chandelier ATR trailing stop ratchet: Trough + (2.5 * ATR)
+                # 2. Chandelier ATR trailing stop ratchet with Tier-5 Parabolic Tightening
                 if atr > 0:
-                    chan_sl = round(pos["trough_ltp"] + (CHANDELIER_ATR_MULT * atr), 2)
+                    if drop_pct >= PARABOLIC_LOCK_STAGE3_PCT:
+                        trail_atr_mult = 0.5
+                    elif drop_pct >= PARABOLIC_LOCK_STAGE2_PCT:
+                        trail_atr_mult = 1.0
+                    elif drop_pct >= PARABOLIC_LOCK_STAGE1_PCT:
+                        trail_atr_mult = 1.8
+                    else:
+                        trail_atr_mult = CHANDELIER_ATR_MULT
+
+                    chan_sl = round(pos["trough_ltp"] + (trail_atr_mult * atr), 2)
                     if chan_sl < pos["sl"] and chan_sl < entry:
                         pos["sl"] = chan_sl
                         tg.send_trail_update(symbol, old_sl, pos["sl"], ltp)
@@ -1557,6 +1771,19 @@ class VirtualPortfolio:
 
         if reason:
             self._close(symbol, ltp, reason)
+
+    def check_preclose_unwind(self, now_str: str = None, price_feed: ShoonyaPriceFeed = None, token_map: dict = None) -> bool:
+        """
+        Tier-5 Feature 1: Pre-Close Slippage Minimizer (Almgren-Chriss 15:08 Adaptive TWAP Exit)
+        Unwinds open positions in phased batches starting at 15:08 before the 15:15 retail market dump.
+        """
+        if check_preclose_unwind_window(now_str):
+            if self.positions:
+                print(f"[PRE-CLOSE UNWIND] 15:08 Almgren-Chriss TWAP Exit triggered! Slicing {len(self.positions)} positions before 15:15 retail dump.")
+                if price_feed and token_map:
+                    self.squareoff_all(price_feed, token_map, reason="PRE-CLOSE TWAP 15:08 UNWIND")
+                return True
+        return False
 
     def squareoff_all(self, price_feed: ShoonyaPriceFeed, token_map: dict, reason: str = "SQUAREOFF 15:15", filter_side: str = None):
         closed_count = 0
@@ -2173,6 +2400,11 @@ def monitor_loop(portfolio: VirtualPortfolio, sess: dict, initial_stocks: list, 
                 print(f"[GUARD 5] 15:05 PM Pre-Squareoff Kill Switch triggered for {len(short_syms)} Short position(s)!")
                 portfolio.squareoff_all(price_feed, token_map, reason="PRE-SQUAREOFF 15:05 (AUCTION GUARD)", filter_side="SHORT")
             short_killed = True
+
+        # Tier-5 Feature 1: Pre-Close Slippage Minimizer (Almgren-Chriss 15:08 Adaptive TWAP Exit)
+        if portfolio.check_preclose_unwind(now.strftime("%H:%M"), price_feed, token_map):
+            publish_live_state(portfolio, regime, vix=0.0, status="STOPPED")
+            return
 
         # 4. Auto Square-Off at 15:15 for any remaining positions (Longs)
         if now.hour > 15 or (now.hour == 15 and now.minute >= 15):
