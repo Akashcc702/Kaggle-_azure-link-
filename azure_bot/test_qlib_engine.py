@@ -1482,9 +1482,80 @@ def test_azure_intraday_tier8_institutional_features():
 
     print("  ✅ All 6 Tier-8 Features verified: Stoikov Micro-Price | Convex Stacker | Sector Spillover Alpha | Permutation Entropy Gate | Adverse Selection Scratch | AC Urgency TWAP = 100% PERFECT!")
 
+def test_azure_intraday_capital_roi_telemetry():
+    print("[TEST 38/38] Testing Capital ROI & P&L Ratio Telemetry Engine (ROIC / ROC Tracking)...")
+    from smallcap_intraday_engine import publish_live_state
+    import telegram_alerts as tg
+
+    # 1. Exact user case: ₹50,000 allocated capital with ₹2,000 realized profit
+    port_user = VirtualPortfolio(capital=50000.0, target_pct=2.5, sl_pct=1.0)
+    port_user.daily_pnl = 2000.0
+
+    telemetry = port_user.get_capital_telemetry()
+    assert telemetry["capital"] == 50000.0
+    assert telemetry["realized_pnl"] == 2000.0
+    assert telemetry["realized_roc_pct"] == 4.0
+    assert telemetry["total_pnl"] == 2000.0
+    assert telemetry["roc_pct"] == 4.0
+    assert telemetry["total_equity"] == 52000.0
+    assert "2000" in telemetry["pnl_str"]
+    assert "50,000" in telemetry["pnl_str"]
+    assert "+4.00%" in telemetry["pnl_str"]
+
+    # 2. Deployed Margin & Live Unrealized MTM Simulation
+    # Add active positions to verify margin deduction & cash reserve
+    port_user.positions["TEST_BUY_STK"] = {
+        "entry": 100.0, "qty": 100, "last_ltp": 102.0, "side": "BUY",
+        "sl": 99.0, "target": 102.5, "sector": "Tech", "breakeven_locked": False
+    }
+    port_user.positions["TEST_SHORT_STK"] = {
+        "entry": 200.0, "qty": 50, "last_ltp": 198.0, "side": "SHORT",
+        "sl": 202.0, "target": 195.0, "sector": "Auto", "breakeven_locked": False
+    }
+
+    # Deployed Margin = 100*100 + 200*50 = 10000 + 10000 = 20000.0
+    # Unrealized P&L = (102-100)*100 + (200-198)*50 = 200 + 100 = 300.0
+    # Total Net P&L = 2000 (realized) + 300 (unrealized) = 2300.0
+    # Free Cash = 50000 - 20000 + 2000 = 32000.0
+    # Total Equity = 50000 + 2300 = 52300.0
+    # ROC % = 2300 / 50000 * 100 = 4.60%
+
+    telem_active = port_user.get_capital_telemetry()
+    assert telem_active["capital"] == 50000.0
+    assert telem_active["deployed_margin"] == 20000.0
+    assert telem_active["free_cash"] == 32000.0
+    assert telem_active["unrealized_pnl"] == 300.0
+    assert telem_active["unrealized_roc_pct"] == 0.60
+    assert telem_active["total_pnl"] == 2300.0
+    assert telem_active["roc_pct"] == 4.60
+    assert telem_active["total_equity"] == 52300.0
+    assert "+4.60%" in telem_active["pnl_str"]
+
+    # 3. Verify Atomic Live State Persistence in data/live_state.json
+    publish_live_state(port_user, regime="BULLISH", vix=13.2)
+    state_path = Path(__file__).parent / "data" / "live_state.json"
+    assert state_path.exists(), "live_state.json must exist"
+    with open(state_path, "r", encoding="utf-8") as f:
+        live_json = json.load(f)
+
+    assert live_json["capital"] == 50000.0
+    assert live_json["deployed_margin"] == 20000.0
+    assert live_json["free_cash"] == 32000.0
+    assert live_json["roc_pct"] == 4.60
+    assert live_json["total_equity"] == 52300.0
+    assert "+4.60%" in live_json["pnl_str"]
+
+    # 4. Verify Telegram Status Formatting Logic
+    tg.set_portfolio(port_user)
+    # Ensure exit alerts accept capital parameter gracefully without exception
+    tg.send_virtual_sell("TEST_BUY_STK", 100.0, 102.0, 100, "TARGET HIT", capital=50000.0)
+    tg.send_virtual_cover("TEST_SHORT_STK", 200.0, 198.0, 50, "TARGET HIT", capital=50000.0)
+
+    print(f"  ✅ Capital ROI Telemetry verified: Starting=₹{telemetry['capital']:,.0f} | Realized=₹{telemetry['realized_pnl']:+,.0f} ({telemetry['realized_roc_pct']:+.2f}%) | Active Margin=₹{telem_active['deployed_margin']:,.0f} | Total Equity=₹{telem_active['total_equity']:,.0f} ({telem_active['roc_pct']:+.2f}%) = 100% PERFECT!")
+
 if __name__ == "__main__":
     print("=" * 68)
-    print("  RUNNING CC ALGOTRADING v4.6 (37-TEST INSTITUTIONAL SUITE)")
+    print("  RUNNING CC ALGOTRADING v4.7 (38-TEST INSTITUTIONAL SUITE)")
     print("=" * 68)
     test_micro_alpha30()
     test_cs_rank()
@@ -1523,8 +1594,9 @@ if __name__ == "__main__":
     test_azure_intraday_tier6_nextlevel_features()
     test_azure_intraday_tier7_institutional_features()
     test_azure_intraday_tier8_institutional_features()
+    test_azure_intraday_capital_roi_telemetry()
     print("=" * 68)
-    print("  🎉 ALL 37 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
+    print("  🎉 ALL 38 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 68)
 
 
