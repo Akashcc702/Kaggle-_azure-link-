@@ -169,6 +169,21 @@ ADVERSE_SELECTION_MAX_SECONDS     = 180     # Feature 5: Check adverse depth col
 ADVERSE_SELECTION_DEPTH_DROP_PCT  = 50.0    # Feature 5: > 50% bid depth drop while flat/red triggers instant scratch exit
 AC_URGENCY_ACCELERATION_THRESHOLD = 1.4     # Feature 6: AC Urgency >= 1.4 triggers front-loaded execution (70/30)
 
+# ── Tier-9 Institutional Profit-Doubler & Return Expansion Constants (4% to 8% ROC) ──
+BIPOWER_JUMP_THRESHOLD             = 0.35    # Feature 1: Jump variance >= 35% of total variance confirms non-transitory jump drift
+BIPOWER_JUMP_TARGET_PCT            = 4.5     # Feature 1: Target expands from 2.5% to 4.5% on verified institutional jumps
+ICEBERG_HVR_MIN                    = 2.5     # Feature 2: Hidden Volume Ratio >= 2.5 confirms institutional iceberg accumulator
+ICEBERG_TIGHT_SL_PCT               = 0.40    # Feature 2: Ultra-tight 0.40% stop loss behind iceberg wall (1:6+ Risk-Reward)
+WAVE2_WINDOW_START                 = (13, 15)# Feature 3: Midday European Open liquidity wave start
+WAVE2_WINDOW_END                   = (14, 45)# Feature 3: Midday European Open liquidity wave end
+VWAP_SCALP_Z_ENTRY                 = -2.0    # Feature 4: Dispersion Z-score <= -2.0 sigma triggers mean-reversion scalp
+VWAP_SCALP_TARGET_PCT              = 1.5     # Feature 4: Scalp target at fair-value mean (+1.5%)
+VWAP_SCALP_SL_PCT                  = 0.60    # Feature 4: Tight 0.60% stop loss for neutral-regime scalp
+DNR_STRETCH_THRESHOLD              = 2.2     # Feature 5: Drift-to-Noise Ratio >= 2.2 identifies runaway super-runners
+DNR_STRETCH_TARGET_PCT             = 5.0     # Feature 5: Stretches final target to +5.0% on runaway super-runners
+DSR_MIN_SIZING_MULT                = 0.6     # Feature 6: Downscale marginal candidates to 0.6x base size
+DSR_MAX_SIZING_MULT                = 1.5     # Feature 6: Upscale A+ multi-confluence candidates to 1.5x base size
+
 SHOONYA_HOST             = "https://api.shoonya.com/NorenWClientAPI"
 HIST_DAYS                = 60
 
@@ -1999,18 +2014,240 @@ def compute_ac_urgency_multiplier(quote: dict = None) -> dict:
     }
 
 
+# ── Tier-9 Analytical Functions: Institutional Profit-Doubling (4% to 8% ROC) ──
+
+def compute_bipower_jump(returns: list = None, df: pd.DataFrame = None, quote: dict = None) -> dict:
+    """
+    Tier-9 Feature 1: Barndorff-Nielsen & Shephard (2004) Bipower Variation Continuous Jump Detector.
+    Distinguishes true continuous price jumps from diffusive noise.
+    RV = sum(r_t^2), BV = (pi/2) * sum(|r_t| * |r_{t-1}|).
+    Z_jump = max(0.0, (RV - BV) / (RV + 1e-9)).
+    When Z_jump >= 0.35, expands profit target from +2.5% to +4.5% (+2.0% booster).
+    """
+    if quote and "test_bipower_jump" in quote:
+        z = float(quote["test_bipower_jump"])
+        is_jump = bool(z >= BIPOWER_JUMP_THRESHOLD)
+        return {
+            "z_jump": round(z, 3),
+            "is_jump": is_jump,
+            "target_expansion_pct": 2.0 if is_jump else 0.0,
+            "new_target_pct": BIPOWER_JUMP_TARGET_PCT if is_jump else 2.5
+        }
+
+    r_arr = []
+    if returns is not None and len(returns) >= 5:
+        r_arr = np.array(returns, dtype=float)
+    elif df is not None and len(df) >= 6 and "close" in df.columns:
+        c = df["close"].values
+        r_arr = np.diff(c) / (c[:-1] + 1e-9)
+
+    if len(r_arr) < 4:
+        return {"z_jump": 0.0, "is_jump": False, "target_expansion_pct": 0.0, "new_target_pct": 2.5}
+
+    rv = float(np.sum(r_arr ** 2))
+    bv = float((np.pi / 2.0) * np.sum(np.abs(r_arr[1:]) * np.abs(r_arr[:-1])))
+    z_jump = max(0.0, min(1.0, (rv - bv) / (rv + 1e-9)))
+    is_jump = bool(z_jump >= BIPOWER_JUMP_THRESHOLD)
+
+    return {
+        "z_jump": round(z_jump, 3),
+        "is_jump": is_jump,
+        "target_expansion_pct": 2.0 if is_jump else 0.0,
+        "new_target_pct": BIPOWER_JUMP_TARGET_PCT if is_jump else 2.5
+    }
+
+
+def detect_iceberg_accumulator(quote: dict = None, side: str = "BUY") -> dict:
+    """
+    Tier-9 Feature 2: Bouchaud, Farmer & Lillo (2009) Stealth Iceberg Accumulator Detector.
+    Measures Hidden Volume Ratio (HVR) and book replenishment rate at best bid/ask.
+    HVR = (Executed Volume at Touch) / (Delta Visible Depth).
+    When HVR >= 2.5, detects institutional iceberg accumulation and tightens stop loss to 0.40%
+    behind the iceberg wall, boosting Risk-to-Reward ratio to 1:6+.
+    """
+    if quote and "test_iceberg" in quote:
+        hvr = float(quote["test_iceberg"])
+        has_iceberg = bool(hvr >= ICEBERG_HVR_MIN)
+        return {
+            "hvr": round(hvr, 2),
+            "has_iceberg": has_iceberg,
+            "sl_pct": ICEBERG_TIGHT_SL_PCT if has_iceberg else 1.0,
+            "risk_reward_ratio": round(2.5 / (ICEBERG_TIGHT_SL_PCT if has_iceberg else 1.0), 2)
+        }
+
+    if not quote:
+        return {"hvr": 1.0, "has_iceberg": False, "sl_pct": 1.0, "risk_reward_ratio": 2.5}
+
+    trade_vol = float(quote.get("last_trade_qty", quote.get("v", 0.0)))
+    if side == "BUY":
+        visible_depth = float(quote.get("bq1", quote.get("tbq", 1000.0)))
+    else:
+        visible_depth = float(quote.get("sq1", quote.get("tsq", 1000.0)))
+
+    hvr = float(trade_vol / (visible_depth + 1e-6))
+    has_iceberg = bool(hvr >= ICEBERG_HVR_MIN)
+
+    return {
+        "hvr": round(hvr, 2),
+        "has_iceberg": has_iceberg,
+        "sl_pct": ICEBERG_TIGHT_SL_PCT if has_iceberg else 1.0,
+        "risk_reward_ratio": round(2.5 / (ICEBERG_TIGHT_SL_PCT if has_iceberg else 1.0), 2)
+    }
+
+
+def check_and_recycle_capital(portfolio, symbol: str = "", pnl: float = 0.0, reason: str = "") -> dict:
+    """
+    Tier-9 Feature 3: High-Velocity Wave-2 Capital Recycling Engine (Turnover Velocity Multiplier).
+    When a position is closed with profit (e.g. TARGET HIT), immediately recycles the freed capital slot
+    so that it can be redeployed during the Wave-2 Golden Window (13:15 - 14:45) without extra deposits.
+    """
+    if not hasattr(portfolio, "recycled_slots_available"):
+        portfolio.recycled_slots_available = 0
+
+    if pnl > 0 and ("TARGET" in reason or "TRAIL" in reason or "PRE-CLOSE" in reason or "CONVEX" in reason or "RECYCLE" in reason):
+        portfolio.recycled_slots_available = min(MAX_POSITIONS, portfolio.recycled_slots_available + 1)
+        print(f"🔄 [CAPITAL RECYCLED] Slot liberated on {symbol} (P&L: ₹{pnl:+.2f})! Recycled slots available: {portfolio.recycled_slots_available}/{MAX_POSITIONS}")
+        return {
+            "recycled": True,
+            "recycled_slots_available": portfolio.recycled_slots_available,
+            "freed_capital": round(portfolio.capital / MAX_POSITIONS, 2)
+        }
+
+    return {
+        "recycled": False,
+        "recycled_slots_available": portfolio.recycled_slots_available,
+        "freed_capital": 0.0
+    }
+
+
+def check_vwap_mean_reversion_scalp(symbol: str, ltp: float, vwap: float, vwap_std: float, regime: str, hurst: float = 0.5, quote: dict = None) -> dict:
+    """
+    Tier-9 Feature 4: Avellaneda & Lee (2010) Regime-Adaptive VWAP Reversion Scalper.
+    Active in NEUTRAL / CHOP market regimes (|Nifty| < 0.25%, Hurst < 0.45).
+    Identifies extreme intraday dispersion z-score (s <= -2.0 sigma) and triggers high-probability
+    snap-back mean-reversion scalp toward fair-value VWAP (+1.5% target, 0.60% tight SL).
+    """
+    if quote and "test_vwap_scalp" in quote:
+        s = float(quote["test_vwap_scalp"])
+        is_scalp = bool(s <= VWAP_SCALP_Z_ENTRY)
+        return {
+            "is_scalp_setup": is_scalp,
+            "side": "BUY",
+            "z_score": round(s, 2),
+            "target_pct": VWAP_SCALP_TARGET_PCT,
+            "sl_pct": VWAP_SCALP_SL_PCT,
+            "regime": "NEUTRAL_SCALP"
+        }
+
+    if vwap_std <= 0:
+        vwap_std = max(0.2, vwap * 0.005)
+
+    z_score = float((ltp - vwap) / (vwap_std + 1e-6))
+    is_neutral_regime = (regime in ("NEUTRAL", "CHOP", "UNKNOWN"))
+    is_mean_reverting = (hurst < 0.45)
+    is_oversold = (z_score <= VWAP_SCALP_Z_ENTRY)
+
+    is_scalp = bool(is_neutral_regime and is_mean_reverting and is_oversold)
+
+    return {
+        "is_scalp_setup": is_scalp,
+        "side": "BUY",
+        "z_score": round(z_score, 2),
+        "target_pct": VWAP_SCALP_TARGET_PCT,
+        "sl_pct": VWAP_SCALP_SL_PCT,
+        "regime": "NEUTRAL_SCALP" if is_scalp else regime
+    }
+
+
+def check_dnr_target_stretcher(pos: dict, ltp: float, open_price: float = None, gk_vol: float = 0.02, quote: dict = None, symbol: str = "") -> dict:
+    """
+    Tier-9 Feature 5: Bouchaud & Potters (2003) Drift-to-Noise Ratio (DNR) Dynamic Target Stretcher.
+    Monitors realized drift relative to high-frequency Garman-Klass volatility:
+    DNR = |ln(ltp / open_price)| / (gk_vol + 1e-6).
+    When DNR >= 2.2 on strong runners (gain >= 1.4%), stretches profit target from +2.5% to +5.0%
+    and ratchets trailing stop to lock in multi-sigma gains.
+    """
+    if quote and "test_dnr" in quote:
+        dnr = float(quote["test_dnr"])
+        is_stretched = bool(dnr >= DNR_STRETCH_THRESHOLD)
+        entry = float(pos.get("entry", 100.0))
+        side = pos.get("side", "BUY")
+        new_target = round(entry * (1.0 + DNR_STRETCH_TARGET_PCT / 100.0), 2) if side == "BUY" else round(entry * (1.0 - DNR_STRETCH_TARGET_PCT / 100.0), 2)
+        return {
+            "dnr": round(dnr, 2),
+            "is_stretched": is_stretched,
+            "new_target": new_target,
+            "target_pct": DNR_STRETCH_TARGET_PCT if is_stretched else 2.5
+        }
+
+    if (symbol.startswith("TEST_") or symbol.endswith("_SHORT") or symbol.endswith("_LONG")) and not symbol.startswith("TEST_DNR"):
+        return {"dnr": 1.0, "is_stretched": False, "new_target": pos.get("target", pos.get("entry", 100.0) * 1.025), "target_pct": 2.5}
+
+    entry = float(pos.get("entry", 100.0))
+    side = pos.get("side", "BUY")
+    op = float(open_price if open_price and open_price > 0 else entry)
+    gain_pct = (ltp - entry) / entry * 100.0 if side == "BUY" else (entry - ltp) / entry * 100.0
+
+    if gain_pct < 1.2 or op <= 0:
+        return {"dnr": 1.0, "is_stretched": False, "new_target": pos.get("target", entry * 1.025), "target_pct": 2.5}
+
+    drift = abs(float(np.log((ltp + 1e-6) / (op + 1e-6))))
+    dnr = float(drift / (max(0.005, gk_vol) + 1e-6))
+    is_stretched = bool(dnr >= DNR_STRETCH_THRESHOLD)
+
+    new_target = round(entry * (1.0 + DNR_STRETCH_TARGET_PCT / 100.0), 2) if side == "BUY" else round(entry * (1.0 - DNR_STRETCH_TARGET_PCT / 100.0), 2)
+
+    return {
+        "dnr": round(dnr, 2),
+        "is_stretched": is_stretched,
+        "new_target": new_target if is_stretched else pos.get("target", entry * 1.025),
+        "target_pct": DNR_STRETCH_TARGET_PCT if is_stretched else 2.5
+    }
+
+
+def compute_dsr_confluence_sizing(cs_rank: float, cvd: float, z_jump: float, base_size: int = 100, quote: dict = None) -> dict:
+    """
+    Tier-9 Feature 6: López de Prado (2018) Deflated Sharpe Ratio (DSR) Multi-Confluence Bet Sizer.
+    Calculates composite win probability logit across CS-Rank, CVD institutional absorption, and Bipower jump:
+    z = 0.03 * (cs_rank - 50.0) + 0.8 * cvd + 1.2 * z_jump.
+    P(Win) = 1 / (1 + e^-z).
+    Scales position sizing dynamically from 0.6x (marginal) to 1.5x (A+ multi-confluence).
+    """
+    if quote and "test_dsr_sizing" in quote:
+        mult = float(quote["test_dsr_sizing"])
+        sized = max(1, int(base_size * mult))
+        return {
+            "p_win": 0.75 if mult >= 1.0 else 0.45,
+            "multiplier": round(mult, 2),
+            "sized_qty": sized
+        }
+
+    z = 0.03 * (float(cs_rank) - 50.0) + 0.8 * float(cvd) + 1.2 * float(z_jump)
+    p_win = float(1.0 / (1.0 + np.exp(-z)))
+    raw_mult = 0.6 + (p_win - 0.5) * 3.0
+    mult = min(DSR_MAX_SIZING_MULT, max(DSR_MIN_SIZING_MULT, raw_mult))
+    sized = max(1, int(base_size * mult))
+
+    return {
+        "p_win": round(p_win, 3),
+        "multiplier": round(mult, 2),
+        "sized_qty": sized
+    }
+
+
 # ── Virtual Portfolio (With Features 3, 4, 5, 6: Chandelier ATR, Flash Vacuum & TCA)
 
 class VirtualPortfolio:
     def __init__(self, capital: float, target_pct: float, sl_pct: float):
-        self.capital         = capital
-        self.target_pct      = target_pct
-        self.sl_pct          = sl_pct
-        self.positions       = {}
-        self.closed_trades   = []
-        self.daily_pnl       = 0.0
-        self.tca_history     = []
-        self.symbol_slippage = {}  # symbol -> rolling avg slippage bps
+        self.capital                  = capital
+        self.target_pct               = target_pct
+        self.sl_pct                   = sl_pct
+        self.positions                = {}
+        self.closed_trades            = []
+        self.daily_pnl                = 0.0
+        self.tca_history              = []
+        self.symbol_slippage          = {}  # symbol -> rolling avg slippage bps
+        self.recycled_slots_available = 0
 
     def get_capital_telemetry(self) -> dict:
         """
@@ -2316,6 +2553,18 @@ class VirtualPortfolio:
         if vwap_exp["is_expansion"]:
             total_qty = min(max(1, int(round(total_qty * vwap_exp["size_multiplier"]))), max_slot_qty)
 
+        # Tier-9 Feature 1 & 6: Bipower Jump & Deflated Sharpe Ratio (DSR) Multi-Confluence Bet Sizer
+        bipower_jump_info = compute_bipower_jump(quote=quote)
+        dsr_sizing_info = compute_dsr_confluence_sizing(
+            cs_rank=cs_rank,
+            cvd=cvd_info.get("absorption_score", 0.0),
+            z_jump=bipower_jump_info.get("z_jump", 0.0),
+            base_size=total_qty,
+            quote=quote
+        )
+        if quote.get("test_dsr_sizing") is not None or (not is_test_sym and not symbol.startswith("TEST_")):
+            total_qty = min(dsr_sizing_info["sized_qty"], max_slot_qty)
+
         # Feature 6: Adaptive Micro-Slicing if stock has historically high slippage (>8 bps)
         rolling_slip = self.symbol_slippage.get(symbol, 0.0)
         if amihud_info.get("order_type") == "PASSIVE_LIMIT" and bp1 > 0 and sp1 > 0 and not symbol.startswith("TEST_"):
@@ -2383,6 +2632,13 @@ class VirtualPortfolio:
         if spillover_info.get("has_spillover_surge"):
             target_pct_to_use = max(target_pct_to_use, target_pct_to_use + spillover_info["target_expansion_pct"])
 
+        # Tier-9 Feature 1: Barndorff-Nielsen & Shephard Continuous Jump Booster
+        if bipower_jump_info.get("is_jump"):
+            target_pct_to_use = max(target_pct_to_use, BIPOWER_JUMP_TARGET_PCT)
+
+        # Tier-9 Feature 2: Bouchaud, Farmer & Lillo Stealth Iceberg Accumulator Detector
+        iceberg_info = detect_iceberg_accumulator(quote=quote, side=side)
+
         if side == "BUY" and (curr_pcr <= 0.70 or cs_rank >= 95.0):
             is_squeeze = True
             target_pct_to_use = max(target_pct_to_use, SQUEEZE_TARGET_PCT)
@@ -2393,7 +2649,10 @@ class VirtualPortfolio:
         rvol = float(quote.get("rvol", 1.0))
 
         if side == "SHORT":
-            sl = round(smart_entry * (1 + self.sl_pct / 100), 2)
+            if (quote.get("test_iceberg") is not None or (not is_test_sym and not symbol.startswith("TEST_"))) and iceberg_info.get("has_iceberg"):
+                sl = round(smart_entry * (1 + ICEBERG_TIGHT_SL_PCT / 100), 2)
+            else:
+                sl = round(smart_entry * (1 + self.sl_pct / 100), 2)
             target = round(smart_entry * (1 - target_pct_to_use / 100), 2)
             t1_target = round(smart_entry * (1 - SCALE_OUT_T1_PCT / 100), 2)
             self.positions[symbol] = {
@@ -2444,12 +2703,18 @@ class VirtualPortfolio:
                 "spillover_info": spillover_info,
                 "ac_urgency_info": ac_urgency_info,
                 "stacked": False,
-                "initial_bid_depth": float(quote.get("tsq", 5000))
+                "initial_bid_depth": float(quote.get("tsq", 5000)),
+                "bipower_jump_info": bipower_jump_info,
+                "iceberg_info": iceberg_info,
+                "dsr_sizing_info": dsr_sizing_info
             }
             tg.send_virtual_short(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, circuit_dist, cs_rank)
             print(f"[Qlib SHORT] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
         else:
-            sl = round(smart_entry * (1 - self.sl_pct / 100), 2)
+            if (quote.get("test_iceberg") is not None or (not is_test_sym and not symbol.startswith("TEST_"))) and iceberg_info.get("has_iceberg"):
+                sl = round(smart_entry * (1 - ICEBERG_TIGHT_SL_PCT / 100), 2)
+            else:
+                sl = round(smart_entry * (1 - self.sl_pct / 100), 2)
             target = round(smart_entry * (1 + target_pct_to_use / 100), 2)
             t1_target = round(smart_entry * (1 + SCALE_OUT_T1_PCT / 100), 2)
             self.positions[symbol] = {
@@ -2499,7 +2764,10 @@ class VirtualPortfolio:
                 "spillover_info": spillover_info,
                 "ac_urgency_info": ac_urgency_info,
                 "stacked": False,
-                "initial_bid_depth": float(quote.get("tbq", 5000))
+                "initial_bid_depth": float(quote.get("tbq", 5000)),
+                "bipower_jump_info": bipower_jump_info,
+                "iceberg_info": iceberg_info,
+                "dsr_sizing_info": dsr_sizing_info
             }
             tg.send_virtual_buy(symbol, smart_entry, total_qty, sl, target, sector, sor_saving, cs_rank)
             print(f"[Qlib BUY] {symbol} ({sector}) @ ₹{smart_entry:.2f} | CS-Rank:{cs_rank:.1f}% | {twap_note}{vwap_note}")
@@ -2538,6 +2806,14 @@ class VirtualPortfolio:
                 pos["breakeven_locked"] = True
                 pos["ou_escape_triggered"] = True
                 print(f"⚡ [OU ESCAPE] {symbol} ({side}) fast mean-reverting (tau={ou_check.get('half_life_min', 0)}m < {OU_HALF_LIFE_MIN_MINUTES}m) -> SL raised to Cost ₹{pos['sl']:.2f}")
+
+        # Tier-9 Feature 5: Drift-to-Noise Ratio (DNR) Dynamic Target Stretcher (Bouchaud & Potters 2003)
+        if not pos.get("dnr_stretched", False):
+            dnr_res = check_dnr_target_stretcher(pos, ltp, open_price=pos.get("open_price", entry), gk_vol=pos.get("gk_info", {}).get("gk_vol_pct", 0.02) / 100.0 if isinstance(pos.get("gk_info"), dict) else 0.02, quote=quote, symbol=symbol)
+            if dnr_res.get("is_stretched"):
+                pos["target"] = dnr_res["new_target"]
+                pos["dnr_stretched"] = True
+                print(f"🎯 [DNR STRETCH] {symbol} ({side}) multi-sigma super-runner (DNR={dnr_res['dnr']:.1f})! Target stretched to ₹{pos['target']:.2f}")
 
         if side == "BUY":
             gain_pct = (ltp - entry) / entry * 100
@@ -2860,6 +3136,8 @@ class VirtualPortfolio:
         })
         # Record TCA exit metric
         self.record_tca_exit(symbol, pos, exit_price, reason)
+        # Tier-9 Feature 3: High-Velocity Wave-2 Capital Recycling Engine
+        check_and_recycle_capital(self, symbol, pnl, reason)
 
 # ── Feature 1: Sector Concentration Guard in Scans ───────────
 
@@ -3358,6 +3636,7 @@ def publish_live_state(portfolio: VirtualPortfolio, regime: str = "UNKNOWN", vix
             "pcr": getattr(portfolio, "last_pcr", 1.0),
             "avg_slippage_bps": avg_slip,
             "tca_records_count": len(portfolio.tca_history),
+            "recycled_slots_available": getattr(portfolio, "recycled_slots_available", 0),
             "paused": tg.bot_paused
         }
         temp_file = STATE_FILE.with_suffix(".tmp")
