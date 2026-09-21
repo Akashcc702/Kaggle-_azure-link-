@@ -2012,6 +2012,50 @@ class VirtualPortfolio:
         self.tca_history     = []
         self.symbol_slippage = {}  # symbol -> rolling avg slippage bps
 
+    def get_capital_telemetry(self) -> dict:
+        """
+        Institutional Return on Invested Capital (ROIC / ROC) Telemetry Engine (GIPS / CFA Standards).
+        Computes allocated capital, deployed margin across open positions, free cash reserve,
+        unrealized mark-to-market P&L, realized daily P&L, net portfolio return %, and total equity.
+        """
+        cap = float(self.capital if getattr(self, "capital", 0.0) > 0 else CAPITAL)
+        deployed_margin = 0.0
+        unrealized_pnl = 0.0
+        for sym, pos in self.positions.items():
+            entry = float(pos.get("entry", 0.0))
+            qty = int(pos.get("qty", 0))
+            ltp = float(pos.get("last_ltp", entry))
+            side = pos.get("side", "BUY")
+            deployed_margin += entry * qty
+            if side == "BUY":
+                unrealized_pnl += (ltp - entry) * qty
+            else:
+                unrealized_pnl += (entry - ltp) * qty
+
+        realized_pnl = float(self.daily_pnl)
+        total_net_pnl = realized_pnl + unrealized_pnl
+        free_cash = max(0.0, cap - deployed_margin + realized_pnl)
+        total_equity = cap + total_net_pnl
+        roc_pct = (total_net_pnl / (cap + 1e-9)) * 100.0
+        realized_roc_pct = (realized_pnl / (cap + 1e-9)) * 100.0
+        unrealized_roc_pct = (unrealized_pnl / (cap + 1e-9)) * 100.0
+
+        pnl_str = f"₹{total_net_pnl:+.2f} / ₹{cap:,.2f} ({roc_pct:+.2f}%)"
+
+        return {
+            "capital": round(cap, 2),
+            "deployed_margin": round(deployed_margin, 2),
+            "free_cash": round(free_cash, 2),
+            "realized_pnl": round(realized_pnl, 2),
+            "realized_roc_pct": round(realized_roc_pct, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "unrealized_roc_pct": round(unrealized_roc_pct, 2),
+            "total_pnl": round(total_net_pnl, 2),
+            "roc_pct": round(roc_pct, 2),
+            "total_equity": round(total_equity, 2),
+            "pnl_str": pnl_str
+        }
+
     def daily_loss_hit(self) -> bool:
         return self.daily_pnl < -(CAPITAL * MAX_DAILY_LOSS_PCT / 100)
 
@@ -2798,13 +2842,14 @@ class VirtualPortfolio:
         pos = self.positions.pop(symbol)
         side = pos.get("side", "BUY")
         qty = pos.get("qty", 1)
+        cap = getattr(self, "capital", CAPITAL)
         if side == "SHORT":
             pnl = (pos["entry"] - exit_price) * qty
-            tg.send_virtual_cover(symbol, pos["entry"], exit_price, qty, reason)
+            tg.send_virtual_cover(symbol, pos["entry"], exit_price, qty, reason, capital=cap)
             print(f"[COVER] {symbol} @ ₹{exit_price:.2f} | P&L: ₹{pnl:+.2f} | {reason}")
         else:
             pnl = (exit_price - pos["entry"]) * qty
-            tg.send_virtual_sell(symbol, pos["entry"], exit_price, qty, reason)
+            tg.send_virtual_sell(symbol, pos["entry"], exit_price, qty, reason, capital=cap)
             print(f"[SELL] {symbol} @ ₹{exit_price:.2f} | P&L: ₹{pnl:+.2f} | {reason}")
 
         self.daily_pnl += pnl
@@ -3278,14 +3323,36 @@ def publish_live_state(portfolio: VirtualPortfolio, regime: str = "UNKNOWN", vix
         slips = [t.get("slippage_bps", 0) for t in portfolio.tca_history]
         avg_slip = round(float(np.mean(slips)), 2) if slips else 0.0
 
+        cap_telemetry = portfolio.get_capital_telemetry() if hasattr(portfolio, "get_capital_telemetry") else {
+            "capital": getattr(portfolio, "capital", CAPITAL),
+            "deployed_margin": 0.0,
+            "free_cash": getattr(portfolio, "capital", CAPITAL),
+            "unrealized_pnl": round(total_open_pnl, 2),
+            "unrealized_roc_pct": 0.0,
+            "realized_pnl": round(portfolio.daily_pnl, 2),
+            "realized_roc_pct": 0.0,
+            "total_pnl": round(portfolio.daily_pnl + total_open_pnl, 2),
+            "roc_pct": 0.0,
+            "total_equity": round(getattr(portfolio, "capital", CAPITAL) + portfolio.daily_pnl + total_open_pnl, 2),
+            "pnl_str": f"₹{portfolio.daily_pnl + total_open_pnl:+.2f}"
+        }
+
         state_data = {
             "engine_status": status,
             "timestamp": datetime.now().strftime("%d-%b-%Y %H:%M:%S IST"),
             "timestamp_epoch": time.time(),
             "positions": positions_copy,
-            "unrealized_pnl": round(total_open_pnl, 2),
-            "realized_pnl": round(portfolio.daily_pnl, 2),
-            "total_pnl": round(portfolio.daily_pnl + total_open_pnl, 2),
+            "capital": cap_telemetry["capital"],
+            "deployed_margin": cap_telemetry["deployed_margin"],
+            "free_cash": cap_telemetry["free_cash"],
+            "unrealized_pnl": cap_telemetry["unrealized_pnl"],
+            "unrealized_roc_pct": cap_telemetry["unrealized_roc_pct"],
+            "realized_pnl": cap_telemetry["realized_pnl"],
+            "realized_roc_pct": cap_telemetry["realized_roc_pct"],
+            "total_pnl": cap_telemetry["total_pnl"],
+            "roc_pct": cap_telemetry["roc_pct"],
+            "total_equity": cap_telemetry["total_equity"],
+            "pnl_str": cap_telemetry["pnl_str"],
             "regime": regime,
             "vix": round(vix, 2),
             "pcr": getattr(portfolio, "last_pcr", 1.0),
@@ -3521,4 +3588,4 @@ if __name__ == "__main__":
 
     # 10. Feature 5: EOD Report + Visual Chart Delivery at 15:30
     time.sleep(15)
-    tg.send_eod_report(portfolio.closed_trades, portfolio.daily_pnl)
+    tg.send_eod_report(portfolio.closed_trades, portfolio.daily_pnl, capital=getattr(portfolio, "capital", CAPITAL))
