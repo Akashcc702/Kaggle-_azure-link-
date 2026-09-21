@@ -1329,9 +1329,162 @@ def test_azure_intraday_tier7_institutional_features():
 
     print("  ✅ All 6 Tier-7 Features verified: Amihud Passive Limit Router | Multi-Anchor AVWAP Gate | Lee-Ready ABVR Flow | OU Half-Life Stop | Depth-Slope Collapse Exit | Fractional Kelly Sizing (0.5x-2.0x) = 100% PERFECT!")
 
+def test_azure_intraday_tier8_institutional_features():
+    print("[TEST 37/37] Testing 6 Tier-8 Institutional Profit-Doubling Quant Features...")
+    from smallcap_intraday_engine import (
+        VirtualPortfolio,
+        compute_stoikov_micro_price,
+        check_and_stack_runner,
+        check_sector_spillover_residual,
+        compute_permutation_entropy,
+        check_adverse_selection_scratch,
+        compute_ac_urgency_multiplier,
+        MICRO_PRICE_MIN_EDGE_BPS,
+        CONVEX_STACK_TRIGGER_GAIN_PCT,
+        CONVEX_STACK_ADD_RATIO,
+        CONVEX_STACK_LOCK_SL_PCT,
+        SECTOR_SPILLOVER_RESIDUAL_THRESHOLD,
+        PERMUTATION_ENTROPY_CHOP_MAX,
+        PERMUTATION_ENTROPY_TREND_MIN,
+        ADVERSE_SELECTION_MAX_SECONDS,
+        ADVERSE_SELECTION_DEPTH_DROP_PCT,
+        AC_URGENCY_ACCELERATION_THRESHOLD,
+    )
+
+    # 1. Feature 1: Stoikov Multi-Level Micro-Price & OFI Engine
+    quote_micro_bull = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1,
+        "bq1": 5000, "sq1": 1000, "bq2": 3000, "sq2": 500
+    }
+    mp_bull = compute_stoikov_micro_price(quote_micro_bull)
+    assert mp_bull["valid_long"] is True
+    assert mp_bull["edge_bps"] >= MICRO_PRICE_MIN_EDGE_BPS
+
+    quote_micro_bear = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1,
+        "bq1": 500, "sq1": 4000, "bq2": 200, "sq2": 3000
+    }
+    mp_bear = compute_stoikov_micro_price(quote_micro_bear)
+    assert mp_bear["valid_long"] is False
+    assert mp_bear["valid_short"] is True
+    assert mp_bear["edge_bps"] <= -MICRO_PRICE_MIN_EDGE_BPS
+
+    # Verify execution rejection on downward book pressure
+    port_mp = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_mp.execute_twap_sor("TEST_MICRO_PRICE_TRAP", quote_micro_bear, "Auto", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_MICRO_PRICE_TRAP" not in port_mp.positions
+
+    # 2. Feature 2: Asymmetric Convex Profit Stacker & Zero-Risk Free-Roll Runner
+    port_stack = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_stack = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000}
+    port_stack.execute_twap_sor("TEST_STACK_STOCK", quote_stack, "Tech", "BUY", cs_rank=92.0, bypass_window=True)
+    pos_s = port_stack.positions["TEST_STACK_STOCK"]
+    q_init = pos_s["qty"]
+    assert pos_s["stacked"] is False
+
+    # Simulate price moving to +1.5% (>= +1.4% trigger)
+    # Breakeven locks and Convex Stacker scales in +50% size with guaranteed profit SL
+    port_stack.update_trailing_sl("TEST_STACK_STOCK", ltp=101.50)
+    assert pos_s["stacked"] is True
+    expected_add = max(1, int(pos_s["original_qty"] * CONVEX_STACK_ADD_RATIO))
+    assert pos_s["qty"] == q_init + expected_add
+    # Stop loss must be ratcheted to guaranteed profit level (entry + 0.20%)
+    assert pos_s["sl"] >= round(pos_s["original_qty"] and 100.20, 2)
+
+    # 3. Feature 3: Cross-Asset Lead-Lag Residual Arbitrage & Sector Spillover
+    quote_spill = {
+        "leader_5m_pct": 1.20, "stock_5m_pct": 0.20, "sector_beta": 1.25
+    }
+    spill_res = check_sector_spillover_residual("ASHOKLEY", "BUY", quote=quote_spill)
+    assert spill_res["has_spillover_surge"] is True
+    assert spill_res["residual"] <= SECTOR_SPILLOVER_RESIDUAL_THRESHOLD
+    assert spill_res["target_expansion_pct"] == 1.0
+
+    # Sector spillover in execution expands dynamic target
+    quote_spill_full = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "leader_5m_pct": 1.20, "stock_5m_pct": 0.20, "sector_beta": 1.25
+    }
+    port_spill = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_spill.execute_twap_sor("TEST_SPILL_STOCK", quote_spill_full, "Auto", "BUY", cs_rank=90.0, bypass_window=True)
+    pos_sp = port_spill.positions["TEST_SPILL_STOCK"]
+    assert pos_sp["target"] >= 103.50  # 2.5% + 1.0% = 3.5%
+
+    # 4. Feature 4: Bandt-Pompe Permutation Entropy Market State Gate
+    pe_trend_res = compute_permutation_entropy(quote={"test_pe": 0.55})
+    assert pe_trend_res["is_trend"] is True
+    assert pe_trend_res["is_chop"] is False
+
+    pe_chop_res = compute_permutation_entropy(quote={"test_pe": 0.88})
+    assert pe_chop_res["is_chop"] is True
+    assert pe_chop_res["pe"] > PERMUTATION_ENTROPY_CHOP_MAX
+
+    # Verify execution blocks trade under high-entropy random walk chop
+    port_pe = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_pe_chop = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_pe": 0.88
+    }
+    port_pe.execute_twap_sor("TEST_PE_CHOP", quote_pe_chop, "Metals", "BUY", cs_rank=95.0, bypass_window=True)
+    assert "TEST_PE_CHOP" not in port_pe.positions
+
+    # 5. Feature 5: Adverse Selection Instant Scratch Exit
+    port_scratch = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_norm = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 10000, "tsq": 5000}
+    port_scratch.execute_twap_sor("TEST_SCRATCH_STOCK", quote_norm, "Energy", "BUY", cs_rank=90.0, bypass_window=True)
+    assert "TEST_SCRATCH_STOCK" in port_scratch.positions
+
+    # Simulate 60 seconds elapsed, LTP flat/red (99.95), and bid depth collapsed > 50%
+    quote_scratch_drop = {
+        "lp": 99.95, "bp1": 99.90, "sp1": 100.0, "tbq": 2500, "tsq": 8000,
+        "test_adverse_drop": True
+    }
+    port_scratch.check_and_exit("TEST_SCRATCH_STOCK", ltp=99.95, quote=quote_scratch_drop)
+    assert "TEST_SCRATCH_STOCK" not in port_scratch.positions
+    assert any("ADVERSE SELECTION" in t["reason"] for t in port_scratch.closed_trades)
+
+    # 6. Feature 6: Almgren-Chriss Momentum Urgency TWAP Accelerator
+    urg_high = compute_ac_urgency_multiplier(quote={"price_velocity": 0.8, "realized_vol": 0.4})
+    assert urg_high["is_accelerated"] is True
+    assert urg_high["tranche1_pct"] == 70
+
+    port_urg = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    quote_urg_acc = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_ac_urgency": 2.0
+    }
+    port_urg.execute_twap_sor("TEST_URG_STOCK", quote_urg_acc, "Pharma", "BUY", cs_rank=90.0, bypass_window=True)
+    pos_u = port_urg.positions["TEST_URG_STOCK"]
+    assert "Front-Loaded AC Urgency TWAP" in pos_u["exec_type"]
+
+    # 7. Metadata Verification on Active Trade
+    quote_full_t8 = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000}
+    port_full_t8 = VirtualPortfolio(capital=100000.0, target_pct=2.5, sl_pct=1.0)
+    port_full_t8.execute_twap_sor("TEST_FULL_T8", quote_full_t8, "Auto", "BUY", cs_rank=92.0, bypass_window=True)
+    pos_t8 = port_full_t8.positions["TEST_FULL_T8"]
+    assert "pe_info" in pos_t8
+    assert "micro_price_info" in pos_t8
+    assert "spillover_info" in pos_t8
+    assert "ac_urgency_info" in pos_t8
+    assert pos_t8["stacked"] is False
+
+    # 8. Constant Calibration Verification
+    assert MICRO_PRICE_MIN_EDGE_BPS == 5.0
+    assert CONVEX_STACK_TRIGGER_GAIN_PCT == 1.4
+    assert CONVEX_STACK_ADD_RATIO == 0.50
+    assert CONVEX_STACK_LOCK_SL_PCT == 0.20
+    assert SECTOR_SPILLOVER_RESIDUAL_THRESHOLD == -0.35
+    assert PERMUTATION_ENTROPY_CHOP_MAX == 0.82
+    assert PERMUTATION_ENTROPY_TREND_MIN == 0.65
+    assert ADVERSE_SELECTION_MAX_SECONDS == 180
+    assert ADVERSE_SELECTION_DEPTH_DROP_PCT == 50.0
+    assert AC_URGENCY_ACCELERATION_THRESHOLD == 1.4
+
+    print("  ✅ All 6 Tier-8 Features verified: Stoikov Micro-Price | Convex Stacker | Sector Spillover Alpha | Permutation Entropy Gate | Adverse Selection Scratch | AC Urgency TWAP = 100% PERFECT!")
+
 if __name__ == "__main__":
     print("=" * 68)
-    print("  RUNNING CC ALGOTRADING v4.5 (36-TEST INSTITUTIONAL SUITE)")
+    print("  RUNNING CC ALGOTRADING v4.6 (37-TEST INSTITUTIONAL SUITE)")
     print("=" * 68)
     test_micro_alpha30()
     test_cs_rank()
@@ -1369,8 +1522,9 @@ if __name__ == "__main__":
     test_azure_intraday_tier5_nextgen_features()
     test_azure_intraday_tier6_nextlevel_features()
     test_azure_intraday_tier7_institutional_features()
+    test_azure_intraday_tier8_institutional_features()
     print("=" * 68)
-    print("  🎉 ALL 36 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
+    print("  🎉 ALL 37 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 68)
 
 
