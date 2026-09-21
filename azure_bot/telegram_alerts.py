@@ -83,17 +83,36 @@ def _handle_command(text: str):
             _send("ℹ️ Bot not yet running or no active session.")
             return
         port = _portfolio_ref
+        cap_telemetry = port.get_capital_telemetry() if hasattr(port, "get_capital_telemetry") else {
+            "capital": getattr(port, "capital", 100000.0),
+            "deployed_margin": sum(p.get("entry", 0.0) * p.get("qty", 0) for p in port.positions.values()),
+            "free_cash": getattr(port, "capital", 100000.0),
+            "total_pnl": port.daily_pnl,
+            "roc_pct": (port.daily_pnl / getattr(port, "capital", 100000.0)) * 100.0,
+            "total_equity": getattr(port, "capital", 100000.0) + port.daily_pnl,
+            "pnl_str": f"₹{port.daily_pnl:+.2f} / ₹{getattr(port, 'capital', 100000.0):,.2f}"
+        }
+        cap = cap_telemetry["capital"]
+        dep = cap_telemetry["deployed_margin"]
+        cash = cap_telemetry["free_cash"]
+        equity = cap_telemetry["total_equity"]
+        roc = cap_telemetry["roc_pct"]
+        tot_pnl = cap_telemetry["total_pnl"]
+        pnl_emoji = "🟢" if tot_pnl >= 0 else "🔴"
+
         if not port.positions:
             _send(
-                f"📊 <b>Bot Status</b>\n"
-                f"📌 Open Positions: None\n"
-                f"💰 Today's Realized P&L: ₹{port.daily_pnl:+.2f}\n"
-                f"⏸️ Paused: {'Yes' if bot_paused else 'No'}\n"
+                f"📊 <b>CC AlgoTrading — Live Status</b>\n\n"
+                f"💰 Total Capital  : <b>₹{cap:,.2f}</b>\n"
+                f"💵 Deployed Margin: <b>₹0.00</b> | Free Cash: <b>₹{cash:,.2f}</b>\n"
+                f"📌 Open Positions : <b>None</b>\n"
+                f"{pnl_emoji} Net P&L (ROC)   : <b>₹{port.daily_pnl:+.2f} / ₹{cap:,.0f} ({port.daily_pnl / (cap + 1e-9) * 100:+.2f}%)</b>\n"
+                f"📈 Total Equity   : <b>₹{equity:,.2f}</b>\n"
+                f"⏸️ Paused         : <b>{'Yes' if bot_paused else 'No'}</b>\n"
                 f"🕐 {now_ist()}"
             )
         else:
             lines = []
-            total_pnl = 0.0
             for sym, pos in port.positions.items():
                 entry = pos["entry"]
                 ltp = pos.get("last_ltp", entry)
@@ -108,7 +127,6 @@ def _handle_command(text: str):
                     sl_dist = ((pos["sl"] - entry) / entry) * 100
                     tgt_dist = ((pos["target"] - entry) / entry) * 100
                     tag = "📈 LONG"
-                total_pnl += pnl
                 sec = pos.get("sector", "General")
                 trail_tag = " 🔒" if pos.get("breakeven_locked") else ""
                 lines.append(
@@ -116,13 +134,15 @@ def _handle_command(text: str):
                     f"     Entry:₹{entry:.2f} | LTP:₹{ltp:.2f} | P&L:₹{pnl:+.2f}\n"
                     f"     SL:₹{pos['sl']:.2f} ({sl_dist:+.1f}%) | TGT:₹{pos['target']:.2f} ({tgt_dist:+.1f}%)"
                 )
-            emoji = "🟢" if total_pnl >= 0 else "🔴"
             _send(
                 f"📊 <b>Live Status — {len(port.positions)} Position(s)</b>\n\n"
                 + "\n".join(lines) + "\n\n"
-                f"{emoji} <b>Open P&L: ₹{total_pnl:+.2f}</b>\n"
-                f"💰 Realized: ₹{port.daily_pnl:+.2f}\n"
-                f"⏸️ Paused: {'Yes' if bot_paused else 'No'}\n"
+                f"💰 Total Capital  : <b>₹{cap:,.2f}</b>\n"
+                f"💵 Deployed Margin: <b>₹{dep:,.2f}</b> | Free Cash: <b>₹{cash:,.2f}</b>\n"
+                f"{pnl_emoji} Net P&L (ROC)   : <b>₹{tot_pnl:+.2f} / ₹{cap:,.0f} ({roc:+.2f}%)</b>\n"
+                f"🏆 Realized Today : ₹{port.daily_pnl:+.2f} / ₹{cap:,.0f} ({port.daily_pnl / (cap + 1e-9) * 100:+.2f}%)\n"
+                f"📈 Total Equity   : <b>₹{equity:,.2f}</b>\n"
+                f"⏸️ Paused         : <b>{'Yes' if bot_paused else 'No'}</b>\n"
                 f"🕐 {now_ist()}"
             )
 
@@ -312,16 +332,17 @@ def send_virtual_buy(symbol: str, ltp: float, qty: int, sl: float, target: float
         f"🕐 {now_ist()}"
     )
 
-def send_virtual_sell(symbol: str, entry: float, exit_price: float, qty: int, reason: str):
+def send_virtual_sell(symbol: str, entry: float, exit_price: float, qty: int, reason: str, capital: float = 0.0):
     pnl = (exit_price - entry) * qty
     pct = (exit_price - entry) / entry * 100
     emoji = "✅" if pnl >= 0 else "❌"
+    cap_text = f"\n📊 Capital Yield : <b>{pnl:+.2f} / ₹{capital:,.0f} ({pnl / (capital + 1e-9) * 100:+.2f}%)</b>" if capital > 0 else ""
     _send(
         f"{emoji} <b>[VIRTUAL LONG EXIT]</b> <code>{symbol}</code>\n"
         f"📌 Entry  : ₹{entry:.2f}\n"
         f"📌 Exit   : ₹{exit_price:.2f}\n"
         f"📦 Qty    : {qty}\n"
-        f"💰 P&L    : ₹{pnl:+.2f} ({pct:+.2f}%)\n"
+        f"💰 P&L    : ₹{pnl:+.2f} ({pct:+.2f}%){cap_text}\n"
         f"📝 Reason : {reason}\n"
         f"🕐 {now_ist()}"
     )
@@ -340,16 +361,17 @@ def send_virtual_short(symbol: str, ltp: float, qty: int, sl: float, target: flo
         f"🕐 {now_ist()}"
     )
 
-def send_virtual_cover(symbol: str, entry: float, exit_price: float, qty: int, reason: str):
+def send_virtual_cover(symbol: str, entry: float, exit_price: float, qty: int, reason: str, capital: float = 0.0):
     pnl = (entry - exit_price) * qty
     pct = (entry - exit_price) / entry * 100
     emoji = "✅" if pnl >= 0 else "❌"
+    cap_text = f"\n📊 Capital Yield : <b>{pnl:+.2f} / ₹{capital:,.0f} ({pnl / (capital + 1e-9) * 100:+.2f}%)</b>" if capital > 0 else ""
     _send(
         f"{emoji} <b>[VIRTUAL SHORT COVER]</b> <code>{symbol}</code>\n"
         f"📌 Short Entry : ₹{entry:.2f}\n"
         f"📌 Buy Cover   : ₹{exit_price:.2f}\n"
         f"📦 Qty         : {qty}\n"
-        f"💰 P&L         : ₹{pnl:+.2f} ({pct:+.2f}%)\n"
+        f"💰 P&L         : ₹{pnl:+.2f} ({pct:+.2f}%){cap_text}\n"
         f"📝 Reason      : {reason}\n"
         f"🕐 {now_ist()}"
     )
@@ -410,7 +432,7 @@ def send_daily_loss_halt(total_loss: float):
         f"🕐 {now_ist()}"
     )
 
-def send_eod_chart(trades: list, total_pnl: float):
+def send_eod_chart(trades: list, total_pnl: float, capital: float = 100000.0):
     """Generate and send visual P&L and Trade Performance chart."""
     try:
         import matplotlib
@@ -449,7 +471,8 @@ def send_eod_chart(trades: list, total_pnl: float):
             ax2.fill_between(range(len(cum_pnl)), cum_pnl, 0, color="#29b6f6", alpha=0.15)
             ax2.set_facecolor("#1e222d")
             ax2.tick_params(colors="#ffffff")
-            ax2.set_title(f"Cumulative Intraday Equity Curve (Net P&L: ₹{total_pnl:+.2f})", color="#b2b5be", fontsize=11)
+            roc_pct = (total_pnl / (capital + 1e-9)) * 100.0
+            ax2.set_title(f"Cumulative Intraday Equity: ₹{capital + total_pnl:,.2f} (₹{total_pnl:+.2f} / ₹{capital:,.0f} | {roc_pct:+.2f}%)", color="#b2b5be", fontsize=11)
             ax2.set_xlabel("Trade Number", color="#ffffff")
         else:
             ax1.set_facecolor("#1e222d")
@@ -462,16 +485,19 @@ def send_eod_chart(trades: list, total_pnl: float):
         plt.savefig(chart_path, dpi=120, facecolor=fig.get_facecolor(), edgecolor="none")
         plt.close()
 
+        roc_pct = (total_pnl / (capital + 1e-9)) * 100.0
         caption = (
             f"📊 <b>EOD Visual Performance Report</b>\n"
-            f"{'🟢' if total_pnl >= 0 else '🔴'} Total P&L: <b>₹{total_pnl:+.2f}</b>\n"
+            f"💰 Capital: ₹{capital:,.2f}\n"
+            f"{'🟢' if total_pnl >= 0 else '🔴'} Total P&L: <b>₹{total_pnl:+.2f} / ₹{capital:,.0f} ({roc_pct:+.2f}%)</b>\n"
+            f"📈 Final Equity: <b>₹{capital + total_pnl:,.2f}</b>\n"
             f"🕐 {now_ist()}"
         )
         _send_photo(chart_path, caption)
     except Exception as e:
         print(f"[CHART ERROR] {e}")
 
-def send_eod_report(trades: list, total_pnl: float):
+def send_eod_report(trades: list, total_pnl: float, capital: float = 100000.0):
     # Sends textual summary, then pushes the visual chart!
     if not trades:
         body = "  No trades executed today (Capital 100% Protected)."
@@ -486,15 +512,21 @@ def send_eod_report(trades: list, total_pnl: float):
         body = "\n".join(lines)
 
     total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+    roc_pct = (total_pnl / (capital + 1e-9)) * 100.0
+    final_equity = capital + total_pnl
     _send(
         f"📊 <b>EOD Report — {datetime.now().strftime('%d-%b-%Y')}</b>\n\n"
         f"{body}\n\n"
-        f"{total_emoji} <b>Total Virtual P&L: ₹{total_pnl:+.2f}</b>\n"
-        f"🕐 {now_ist()}\n"
-        f"💰 Mode: VIRTUAL (Paper Trading)"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Starting Capital : <b>₹{capital:,.2f}</b>\n"
+        f"{total_emoji} Total Net Profit : <b>₹{total_pnl:+.2f} / ₹{capital:,.0f} ({roc_pct:+.2f}%)</b>\n"
+        f"📈 Final Day Equity : <b>₹{final_equity:,.2f}</b>\n"
+        f"💰 Mode             : VIRTUAL (Paper Trading)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {now_ist()}"
     )
     # Also deliver visual chart!
-    send_eod_chart(trades, total_pnl)
+    send_eod_chart(trades, total_pnl, capital=capital)
 
 def send_squareoff_alert(n_positions: int):
     _send(
