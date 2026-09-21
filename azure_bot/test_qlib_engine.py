@@ -1716,10 +1716,182 @@ def test_azure_intraday_tier9_profit_doubler_features():
 
     print("  ✅ All 6 Tier-9 Features verified: Bipower Jump Target Booster (+4.5%) | Iceberg Accumulator 0.4% SL | Capital Recycling | VWAP Reversion Scalp | DNR Super-Runner Stretch (+5.0%) | DSR Bet Sizing (0.6x-1.5x) = 100% PERFECT!")
 
+def test_azure_intraday_tier10_profit_doubler_features():
+    print("[TEST 40/40] Testing 6 Tier-10 Institutional Profit-Doubling Quant Features (8% to 16% ROC)...")
+    from smallcap_intraday_engine import (
+        VirtualPortfolio,
+        detect_gamma_trap_squeeze,
+        check_wave3_short_covering_window,
+        compute_mis_micro_var_sizing,
+        compute_passive_spread_peg,
+        detect_liquidity_hole_spike,
+        apply_house_money_protection,
+        GAMMA_TRAP_OI_SPIKE_RATIO,
+        GAMMA_TRAP_TARGET_PCT,
+        WAVE3_WINDOW_START,
+        WAVE3_WINDOW_END,
+        MIS_LEVERAGE_MULT,
+        MICRO_VAR_MAX_RUPEE_RISK,
+        PASSIVE_PEG_SPREAD_MIN_BPS,
+        LIQUIDITY_HOLE_SPIKE_Z,
+        LIQUIDITY_HOLE_TARGET_PCT,
+        HOUSE_MONEY_PROTECT_RATIO,
+        HOUSE_MONEY_MIN_TRIGGER_PNL,
+    )
+
+    # 1. Feature 1: Battalio & Jennings Micro-Squeeze Delta Momentum & Gamma-Trap Radar
+    gamma_detected = detect_gamma_trap_squeeze(quote={"test_gamma_trap": 2.2})
+    assert gamma_detected["is_gamma_trap"] is True
+    assert gamma_detected["gamma_ratio"] == 2.2
+    assert gamma_detected["target_expansion_pct"] == 1.0
+    assert gamma_detected["new_target_pct"] == GAMMA_TRAP_TARGET_PCT  # 3.5%
+
+    gamma_normal = detect_gamma_trap_squeeze(quote={"test_gamma_trap": 1.2})
+    assert gamma_normal["is_gamma_trap"] is False
+    assert gamma_normal["target_expansion_pct"] == 0.0
+    assert gamma_normal["new_target_pct"] == 2.5
+
+    # Target expansion in execution (₹100 entry -> ₹103.50 target)
+    port_gamma = VirtualPortfolio(capital=50000.0, target_pct=2.5, sl_pct=1.0)
+    quote_gamma = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_gamma_trap": 2.5
+    }
+    port_gamma.execute_twap_sor("TEST_GAMMA_SQUEEZE", quote_gamma, "Auto", "BUY", cs_rank=90.0, bypass_window=True, pcr=0.80)
+    pos_gamma = port_gamma.positions["TEST_GAMMA_SQUEEZE"]
+    assert pos_gamma["target"] == 103.50
+    assert pos_gamma["gamma_trap_info"]["is_gamma_trap"] is True
+
+    # 2. Feature 2: Wave-3 Short-Covering & Settlement Surge Window
+    assert check_wave3_short_covering_window((14, 45)) is True
+    assert check_wave3_short_covering_window((14, 30)) is True
+    assert check_wave3_short_covering_window((15, 5)) is True
+    assert check_wave3_short_covering_window((11, 00)) is False
+    assert check_wave3_short_covering_window((15, 15)) is False
+
+    # 3. Feature 3: Jorion SEBI Dynamic Intraday Margin (MIS) Optimizer with Micro-VaR Stop
+    # Capital: ₹50,000, 3 slots -> ₹16,666.67 slot capital. With 2.5x MIS = ₹41,666.67 buying power.
+    # At LTP ₹100, max_qty_mis = 416 shares.
+    # At 1% SL = ₹1/share risk -> 416 shares = ₹416 risk, which exceeds ₹350 Micro-VaR cap!
+    # Engine clips quantity to 350 shares so max risk <= ₹350.00.
+    mis_sizing = compute_mis_micro_var_sizing(capital=50000.0, sl_pct=1.0, mis_mult=2.5, ltp=100.0)
+    assert mis_sizing["mis_mult"] == 2.5
+    assert mis_sizing["sized_qty"] == 350
+    assert mis_sizing["max_rupee_risk"] == 350.0
+
+    # Sizing integration in execution
+    port_mis = VirtualPortfolio(capital=50000.0, target_pct=2.5, sl_pct=1.0)
+    quote_mis = {
+        "lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000,
+        "test_mis_sizing": 2.5
+    }
+    port_mis.execute_twap_sor("TEST_MIS_VAR", quote_mis, "Power", "BUY", cs_rank=90.0, bypass_window=True)
+    pos_mis = port_mis.positions["TEST_MIS_VAR"]
+    assert "mis_sizing_info" in pos_mis
+    assert pos_mis["mis_sizing_info"]["max_rupee_risk"] <= MICRO_VAR_MAX_RUPEE_RISK
+
+    # 4. Feature 4: Stoikov Level-3 Passive Spread Harvesting & Micro-Price Pegging
+    # Wide spread: bp1=99.90, sp1=100.10 (20 bps >= 8.0 bps)
+    quote_wide = {"bp1": 99.90, "sp1": 100.10, "lp": 100.0}
+    peg_res = compute_passive_spread_peg(quote_wide, side="BUY")
+    assert peg_res["use_passive_peg"] is True
+    assert peg_res["pegged_price"] == 99.90
+    assert peg_res["savings_bps"] >= 8.0
+    assert peg_res["order_type"] == "PASSIVE_LIMIT"
+
+    # Narrow spread: bp1=99.99, sp1=100.01 (2 bps < 8.0 bps)
+    quote_tight = {"bp1": 99.99, "sp1": 100.01, "lp": 100.0}
+    peg_tight = compute_passive_spread_peg(quote_tight, side="BUY")
+    assert peg_tight["use_passive_peg"] is False
+    assert peg_tight["order_type"] == "MIDPOINT"
+
+    # Execution integration: Passive peg entry recording
+    port_peg = VirtualPortfolio(capital=50000.0, target_pct=2.5, sl_pct=1.0)
+    quote_peg_exec = {
+        "lp": 100.0, "bp1": 99.90, "sp1": 100.10, "tbq": 50000, "tsq": 50000,
+        "test_passive_peg": 99.92
+    }
+    port_peg.execute_twap_sor("TEST_PASSIVE_PEG_STK", quote_peg_exec, "Metals", "BUY", cs_rank=90.0, bypass_window=True)
+    pos_peg = port_peg.positions["TEST_PASSIVE_PEG_STK"]
+    assert pos_peg["entry"] == 99.92
+    assert "Passive Micro-Price Peg" in pos_peg["exec_type"]
+    assert "passive_peg_info" in pos_peg
+
+    # 5. Feature 5: Avellaneda & Lee Liquidity Hole Spike Fading
+    spike_detected = detect_liquidity_hole_spike("TEST_SPIKE", ltp=103.50, open_p=100.0, gk_vol=0.010)
+    assert spike_detected["is_spike"] is True
+    assert spike_detected["z_score"] >= LIQUIDITY_HOLE_SPIKE_Z
+    assert spike_detected["pullback_pct"] == LIQUIDITY_HOLE_TARGET_PCT
+
+    spike_normal = detect_liquidity_hole_spike("TEST_SPIKE", ltp=100.40, open_p=100.0, gk_vol=0.015)
+    assert spike_normal["is_spike"] is False
+
+    # Trailing SL update tightening on false spike
+    port_spike = VirtualPortfolio(capital=50000.0, target_pct=2.5, sl_pct=1.0)
+    quote_spike_init = {"lp": 100.0, "bp1": 99.9, "sp1": 100.1, "tbq": 50000, "tsq": 50000}
+    port_spike.execute_twap_sor("TEST_SPIKE_TIGHT", quote_spike_init, "Consumer", "BUY", cs_rank=90.0, bypass_window=True)
+    pos_spike = port_spike.positions["TEST_SPIKE_TIGHT"]
+    sl_pre = pos_spike["sl"]
+    port_spike.update_trailing_sl("TEST_SPIKE_TIGHT", ltp=103.0, quote={"test_liquidity_spike": 3.4})
+    assert pos_spike["liquidity_spike_locked"] is True
+    assert pos_spike["sl"] > sl_pre  # Tightened trailing SL to lock profit
+
+    # 6. Feature 6: Thorp & Vince "House Money" Asymmetric Capital Lock Engine
+    port_house = VirtualPortfolio(capital=50000.0, target_pct=2.5, sl_pct=1.0)
+    # Below trigger (< ₹2000): House money inactive
+    hm_low = apply_house_money_protection(port_house, current_pnl=1500.0)
+    assert hm_low["house_money_active"] is False
+    assert hm_low["locked_floor"] == 0.0
+
+    # Above trigger (>= ₹2000): Locks 75% profit, 0% base risk
+    hm_high = apply_house_money_protection(port_house, current_pnl=3000.0)
+    assert hm_high["house_money_active"] is True
+    assert hm_high["locked_floor"] == 2250.0  # 3000 * 0.75
+    assert hm_high["active_risk_budget"] == 750.0  # 3000 * 0.25
+    assert hm_high["base_capital_risk"] == 0.0
+
+    # Integration in _close(): Closing winning trade triggers House Money protection
+    port_house.positions["TEST_HM_STK"] = {
+        "entry": 100.0, "qty": 100, "last_ltp": 102.5, "side": "BUY",
+        "sl": 99.0, "target": 102.5, "sector": "Tech"
+    }
+    port_house.daily_pnl = 200.0
+    port_house._close("TEST_HM_STK", 123.00, "TARGET HIT")  # PnL = (123 - 100) * 100 = +2300, total = +2500
+    assert port_house.house_money_active is True
+    assert port_house.house_money_floor == 1875.0  # 2500 * 0.75 = 1875.0
+    assert port_house.active_risk_budget == 625.0
+
+    # 7. Tier-10 Constants Calibration Verification
+    assert GAMMA_TRAP_OI_SPIKE_RATIO == 1.8
+    assert GAMMA_TRAP_TARGET_PCT == 3.5
+    assert WAVE3_WINDOW_START == (14, 30)
+    assert WAVE3_WINDOW_END == (15, 5)
+    assert MIS_LEVERAGE_MULT == 2.5
+    assert MICRO_VAR_MAX_RUPEE_RISK == 350.0
+    assert PASSIVE_PEG_SPREAD_MIN_BPS == 8.0
+    assert LIQUIDITY_HOLE_SPIKE_Z == 3.0
+    assert LIQUIDITY_HOLE_TARGET_PCT == 1.8
+    assert HOUSE_MONEY_PROTECT_RATIO == 0.75
+    assert HOUSE_MONEY_MIN_TRIGGER_PNL == 2000.0
+
+    # 8. User End-to-End Profit Doubler Verification: ₹50,000 capital -> ₹8,000 profit (+16.00% ROC)
+    port_doubler10 = VirtualPortfolio(capital=50000.0, target_pct=2.5, sl_pct=1.0)
+    port_doubler10.daily_pnl = 8000.0
+    t_doubler10 = port_doubler10.get_capital_telemetry()
+    assert t_doubler10["capital"] == 50000.0
+    assert t_doubler10["realized_pnl"] == 8000.0
+    assert t_doubler10["roc_pct"] == 16.00
+    assert t_doubler10["total_equity"] == 58000.0
+    assert "+16.00%" in t_doubler10["pnl_str"]
+    assert "8000" in t_doubler10["pnl_str"]
+    assert "50,000" in t_doubler10["pnl_str"]
+
+    print("  ✅ All 6 Tier-10 Features verified: Gamma-Trap Target (+3.5%) | Wave-3 Window | MIS Micro-VaR Sizing (<=₹350) | Stoikov Passive Peg | Liquidity Hole Fade | House Money Floor Lock (75%) = 100% PERFECT!")
+
 
 if __name__ == "__main__":
     print("=" * 68)
-    print("  RUNNING CC ALGOTRADING v4.8 (39-TEST INSTITUTIONAL SUITE)")
+    print("  RUNNING CC ALGOTRADING v4.9 (40-TEST INSTITUTIONAL SUITE)")
     print("=" * 68)
     test_micro_alpha30()
     test_cs_rank()
@@ -1760,9 +1932,11 @@ if __name__ == "__main__":
     test_azure_intraday_tier8_institutional_features()
     test_azure_intraday_capital_roi_telemetry()
     test_azure_intraday_tier9_profit_doubler_features()
+    test_azure_intraday_tier10_profit_doubler_features()
     print("=" * 68)
-    print("  🎉 ALL 39 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
+    print("  🎉 ALL 40 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 68)
+
 
 
 
