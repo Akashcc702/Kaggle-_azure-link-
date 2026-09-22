@@ -76,6 +76,15 @@ mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/data"
 chmod 755 "$SCRIPT_DIR"
 echo "✅ Logs and data directories verified."
 
+# Install & Enable 24x7 Telegram Daemon Service
+echo "Installing and enabling 24x7 Telegram Daemon Service..."
+if [ -f "$SCRIPT_DIR/tg_daemon.service" ]; then
+    sudo cp "$SCRIPT_DIR/tg_daemon.service" /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now tg_daemon.service || true
+    echo "✅ tg_daemon.service installed and enabled for 24x7 auto-boot!"
+fi
+
 echo ""
 echo "============================================================"
 echo " [4/4] System Memory & Swap Verification Summary"
