@@ -560,36 +560,72 @@ def handle_command(text: str):
         )
 
 
-# ── Polling Engine ───────────────────────────────────────────
-
-def drop_pending_updates():
-    """Drop any stale backlog messages from hours ago so they don't replay."""
+def process_pending_queue(max_age_seconds: int = 7200) -> int:
+    """
+    Intelligently processes pending updates queue upon daemon startup:
+      - Immediately processes and replies to recent commands (within max_age_seconds, e.g. 2 hours).
+      - Drops stale messages older than 24 hours.
+      - Advances offset cleanly so no message is lost or re-executed twice.
+    """
+    global BASE_URL, CHAT_ID
+    processed_count = 0
     try:
-        resp = requests.get(f"{BASE_URL}/getUpdates", params={"offset": -1}, timeout=10).json()
-        if resp.get("ok") and resp.get("result"):
-            last_id = resp["result"][-1]["update_id"]
-            # Flush by advancing offset
+        resp = requests.get(f"{BASE_URL}/getUpdates", params={"offset": 0, "limit": 100}, timeout=10).json()
+        if not resp.get("ok"):
+            return 0
+        
+        updates = resp.get("result", [])
+        if not updates:
+            return 0
+            
+        now_ts = time.time()
+        last_id = 0
+        for upd in updates:
+            upd_id = upd.get("update_id", 0)
+            last_id = max(last_id, upd_id)
+            msg = upd.get("message", {})
+            sender_chat = str(msg.get("chat", {}).get("id", ""))
+            msg_ts = msg.get("date", 0)
+            
+            # If from authorized chat and within recent window
+            if sender_chat == CHAT_ID:
+                text = msg.get("text", "").strip()
+                if text.startswith("/"):
+                    age = now_ts - msg_ts
+                    if age <= max_age_seconds:
+                        print(f"[{now_ist()}] [STARTUP QUEUE] Processing recent queued command ({int(age)}s old): {text}")
+                        handle_command(text)
+                        processed_count += 1
+                    else:
+                        print(f"[{now_ist()}] [STARTUP QUEUE] Dropping stale queued command ({int(age)}s old): {text}")
+
+        # Advance offset past all consumed updates
+        if last_id > 0:
             requests.get(f"{BASE_URL}/getUpdates", params={"offset": last_id + 1, "limit": 1}, timeout=10)
-            print(f"[{now_ist()}] [INIT] Flushed stale message backlog up to update_id={last_id}.")
+            print(f"[{now_ist()}] [STARTUP QUEUE] Advanced offset to {last_id + 1}. Processed {processed_count} recent message(s).")
+            
     except Exception as e:
-        print(f"[{now_ist()}] [INIT BACKLOG ERROR] {e}")
+        print(f"[{now_ist()}] [QUEUE INIT ERROR] {e}")
+        
+    return processed_count
 
 def main():
     print("=" * 60)
-    print(f"  CC AlgoTrading — Dedicated Telegram Daemon v3.5")
+    print(f"  CC AlgoTrading — Dedicated Telegram Daemon v3.5 (24x7 Live)")
     print(f"  Started at : {now_ist()}")
     print(f"  Chat ID    : {CHAT_ID}")
     print("=" * 60)
 
-    # 1. Clean out old messages
-    drop_pending_updates()
+    # 1. Process recent queued messages & clean stale backlog
+    processed = process_pending_queue(max_age_seconds=7200)
 
     # 2. Notify operator that daemon is active
     send_msg(
         f"🤖 <b>Telegram 24x7 Control Daemon v3.5 STARTED</b>\n"
         f"🕐 {now_ist()}\n"
         f"⚡ <b>Instant &lt; 1s Response Active</b>\n"
-        f"<i>Send /status or /help anytime!</i>"
+        f"📥 Processed: <b>{processed} queued command(s)</b>\n"
+        f"<i>Send /status, /health or /help anytime!</i>"
     )
 
     last_update = 0
