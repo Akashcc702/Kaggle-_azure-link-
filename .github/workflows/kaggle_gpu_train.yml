@@ -138,6 +138,7 @@ jobs:
 
       - name: Deploy Alpha Weights to Azure VM
         uses: appleboy/scp-action@v0.1.7
+        continue-on-error: true
         with:
           host: ${{ secrets.AZURE_VM_HOST }}
           username: ${{ secrets.AZURE_VM_USER }}
@@ -148,6 +149,7 @@ jobs:
 
       - name: Restart Intraday Trading Engine on Azure VM
         uses: appleboy/ssh-action@v1.0.3
+        continue-on-error: true
         with:
           host: ${{ secrets.AZURE_VM_HOST }}
           username: ${{ secrets.AZURE_VM_USER }}
@@ -158,7 +160,7 @@ jobs:
             echo "Azure VM trading engine reloaded with fresh GPU weights!"
 
       - name: Dispatch Telegram Success Alert
-        if: success()
+        if: always()
         run: |
           python -c '
           import os, requests, json
