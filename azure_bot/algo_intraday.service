@@ -1,0 +1,19 @@
+[Unit]
+Description=CC AlgoTrading Intraday Engine v3.0 (Self-Healing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/azure_bot
+ExecStart=/home/azureuser/algo_env/bin/python3 /home/azureuser/azure_bot/smallcap_intraday_engine.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+LimitNOFILE=65536
+StandardOutput=append:/home/azureuser/azure_bot/logs/engine.log
+StandardError=append:/home/azureuser/azure_bot/logs/engine.log
+
+[Install]
+WantedBy=multi-user.target
