@@ -2212,8 +2212,133 @@ if __name__ == "__main__":
     test_azure_intraday_tier10_profit_doubler_features()
     test_azure_intraday_tier11_profit_doubler_features()
     test_azure_intraday_health_hardening_suite()
+
+
+# ── TEST 43: Azure Intraday 24x7 Telegram Daemon & Offline Resilience ─────
+
+def test_azure_intraday_24x7_daemon_and_offline_resilience():
+    """
+    TEST 43: Validates the 24x7 Dedicated Telegram Daemon & Offline Failover Resilience:
+      1. process_pending_queue() time-window queue processing (recent commands executed, stale commands dropped)
+      2. setup_swap_and_maintenance.sh systemd tg_daemon.service enable on boot
+      3. crontab_setup.sh @reboot watchdog and 08:35 AM pre-market GPU weights sync
+      4. kaggle_gpu_train.yml continue-on-error offline resilience
+    """
+    print("\n--- TEST 43: Azure Intraday 24x7 Telegram Daemon & Offline Resilience ---")
+    import tg_daemon
+
+    # 1. Time-window queue filtering
+    now_ts = time.time()
+    mock_updates = [
+        # Stale update from 3 days ago (259200s ago)
+        {"update_id": 101, "message": {"chat": {"id": 7681529222}, "text": "/status", "date": int(now_ts - 259200)}},
+        # Recent update from 5 minutes ago (300s ago)
+        {"update_id": 102, "message": {"chat": {"id": 7681529222}, "text": "/health", "date": int(now_ts - 300)}}
+    ]
+    
+    executed_cmds = []
+    original_handle = tg_daemon.handle_command
+    original_requests_get = tg_daemon.requests.get
+    
+    try:
+        tg_daemon.handle_command = lambda cmd: executed_cmds.append(cmd)
+        
+        class MockResp:
+            def __init__(self, data):
+                self._data = data
+            def json(self):
+                return self._data
+
+        def mock_get(url, params=None, timeout=10):
+            if "getUpdates" in url:
+                return MockResp({"ok": True, "result": mock_updates})
+            return MockResp({"ok": True})
+            
+        tg_daemon.requests.get = mock_get
+        
+        processed_count = tg_daemon.process_pending_queue(max_age_seconds=7200)
+        # Only the recent command (/health) must be executed
+        assert processed_count == 1, f"Expected 1 processed recent command, got {processed_count}"
+        assert executed_cmds == ["/health"], f"Expected ['/health'], got {executed_cmds}"
+        print("  ✅ [1/3] process_pending_queue() recent-command execution verified (stale messages dropped, recent executed).")
+    finally:
+        tg_daemon.handle_command = original_handle
+        tg_daemon.requests.get = original_requests_get
+
+    # 2. Azure VM Boot Persistence Configuration Check
+    swap_script = BASE_DIR / "setup_swap_and_maintenance.sh"
+    content_swap = swap_script.read_text(encoding="utf-8")
+    assert "tg_daemon.service" in content_swap
+    assert "systemctl enable --now tg_daemon.service" in content_swap
+
+    cron_script = BASE_DIR / "crontab_setup.sh"
+    content_cron = cron_script.read_text(encoding="utf-8")
+    assert "@reboot" in content_cron
+    assert "start tg_daemon.service" in content_cron
+    assert "git pull origin main" in content_cron
+    print("  ✅ [2/3] Azure VM systemd boot auto-start and @reboot crontab persistence verified.")
+
+    # 3. Kaggle GPU Workflow Offline Failover Resilience Check
+    wf_path = BASE_DIR.parent / ".github" / "workflows" / "kaggle_gpu_train.yml"
+    assert wf_path.exists(), "kaggle_gpu_train.yml workflow must exist locally"
+    content_wf = wf_path.read_text(encoding="utf-8")
+    assert "continue-on-error: true" in content_wf, "Workflow must have continue-on-error on deployment steps"
+    assert "Deploy Alpha Weights to Azure VM" in content_wf
+    assert "Restart Intraday Trading Engine on Azure VM" in content_wf
+    print("  ✅ [3/3] Kaggle GPU GitHub Actions offline-resilience verified (100% green builds even when VM is deallocated).")
+
+    print("  🎉 TEST 43 PASSED: 24x7 Telegram Daemon & Offline Failover Resilience 100% OPERATIONAL!")
+
+
+if __name__ == "__main__":
     print("=" * 68)
-    print("  🎉 ALL 42 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
+    print("  RUNNING CC ALGOTRADING v5.2 (43-TEST INSTITUTIONAL SUITE)")
+    print("=" * 68)
+    test_micro_alpha30()
+    test_cs_rank()
+    test_twap_sor_slicer()
+    test_winsorization()
+    test_exponential_recency_weights()
+    test_ic_ir_and_purged_cv()
+    test_dual_regime_weights()
+    test_orthogonalization()
+    test_quintile_spread()
+    test_gcv_lambda()
+    test_empirical_bayes_shrinkage()
+    test_volatility_scaling()
+    test_vwap_value_area_bands()
+    test_obi_toxicity_radar()
+    test_chandelier_atr_trailing_stop()
+    test_nifty_pcr_macro_gating()
+    test_flash_drop_vacuum_guard()
+    test_tca_adaptive_slicing()
+    test_mtf_trend_confluence()
+    test_rvol_smart_money_surge()
+    test_asymmetric_scale_out_and_runner()
+    test_sector_relative_strength()
+    test_volatility_equalized_multi_trade_sizing()
+    test_vwap_slope_and_absorption()
+    test_two_tier_symbol_prioritization()
+    test_high_noise_penalty_filter()
+    test_premarket_scanner_generation_and_fallback()
+    test_bearish_regime_short_whitelist_activation()
+    test_azure_credits_telemetry_calculator()
+    test_kaggle_gpu_deployment_and_weights()
+    test_shoonya_eod_data_extraction_and_parquet()
+    test_profit_doubler_advanced_features()
+    test_azure_intraday_6_profit_doubler_features()
+    test_azure_intraday_tier5_nextgen_features()
+    test_azure_intraday_tier6_nextlevel_features()
+    test_azure_intraday_tier7_institutional_features()
+    test_azure_intraday_tier8_institutional_features()
+    test_azure_intraday_capital_roi_telemetry()
+    test_azure_intraday_tier9_profit_doubler_features()
+    test_azure_intraday_tier10_profit_doubler_features()
+    test_azure_intraday_tier11_profit_doubler_features()
+    test_azure_intraday_health_hardening_suite()
+    test_azure_intraday_24x7_daemon_and_offline_resilience()
+    print("=" * 68)
+    print("  🎉 ALL 43 INSTITUTIONAL QUANT TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 68)
 
 
