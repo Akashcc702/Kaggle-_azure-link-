@@ -4070,9 +4070,25 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "live_state.json"
 CMD_FILE = DATA_DIR / "control_cmd.json"
 
-def publish_live_state(portfolio: VirtualPortfolio, regime: str = "UNKNOWN", vix: float = 0.0, status: str = "RUNNING"):
-    """Atomically publish live portfolio state for the dedicated Telegram Daemon."""
+_LAST_STATE_WRITE_TS = 0.0
+_LAST_STATE_SIGNATURE = ""
+
+def publish_live_state(portfolio: VirtualPortfolio, regime: str = "UNKNOWN", vix: float = 0.0, status: str = "RUNNING", force: bool = False):
+    """
+    Atomically publish live portfolio state for the dedicated Telegram Daemon.
+    Optimized with Dirty-State Checking and 3.0s I/O Throttling to eliminate disk wear.
+    """
+    global _LAST_STATE_WRITE_TS, _LAST_STATE_SIGNATURE
     try:
+        now_ts = time.time()
+        # Build rapid signature for dirty checking
+        pos_keys = tuple(sorted(portfolio.positions.keys()))
+        sig = f"{status}_{len(portfolio.positions)}_{pos_keys}_{round(portfolio.daily_pnl, 2)}"
+        
+        # Throttle writes if state hasn't changed and interval < 3.0s
+        if not force and sig == _LAST_STATE_SIGNATURE and (now_ts - _LAST_STATE_WRITE_TS < 3.0):
+            return
+
         positions_copy = {}
         total_open_pnl = 0.0
         for sym, pos in list(portfolio.positions.items()):
@@ -4116,7 +4132,7 @@ def publish_live_state(portfolio: VirtualPortfolio, regime: str = "UNKNOWN", vix
         state_data = {
             "engine_status": status,
             "timestamp": datetime.now().strftime("%d-%b-%Y %H:%M:%S IST"),
-            "timestamp_epoch": time.time(),
+            "timestamp_epoch": now_ts,
             "positions": positions_copy,
             "capital": cap_telemetry["capital"],
             "deployed_margin": cap_telemetry["deployed_margin"],
@@ -4147,6 +4163,8 @@ def publish_live_state(portfolio: VirtualPortfolio, regime: str = "UNKNOWN", vix
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(state_data, f, indent=2)
         os.replace(temp_file, STATE_FILE)
+        _LAST_STATE_WRITE_TS = now_ts
+        _LAST_STATE_SIGNATURE = sig
     except Exception as e:
         print(f"[IPC STATE ERROR] {e}")
 
