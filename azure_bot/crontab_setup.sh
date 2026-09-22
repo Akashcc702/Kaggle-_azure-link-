@@ -16,6 +16,12 @@ cat << 'CRON' | crontab -
 # 08:30 AM IST: Daily System Health Watchdog Heartbeat
 30 8 * * 1-5 /home/azureuser/algo_env/bin/python3 /home/azureuser/azure_bot/system_watchdog.py --mode heartbeat >> /home/azureuser/azure_bot/logs/watchdog.log 2>&1
 
+# @reboot: Auto-start 24x7 Telegram Daemon Service upon VM Boot
+@reboot /bin/bash -c "sudo systemctl start tg_daemon.service 2>/dev/null || true"
+
+# 08:35 AM IST: Pre-Market GPU Alpha Weights Cloud Sync (Pulls latest Kaggle GPU weights)
+35 8 * * 1-5 cd /home/azureuser/azure_bot && git pull origin main 2>/dev/null || true
+
 # 08:45 AM IST: Headless Chrome OAuth Login (Zombie Reaped)
 45 8 * * 1-5 /home/azureuser/algo_env/bin/python3 /home/azureuser/azure_bot/oauth_headless_login.py >> /home/azureuser/azure_bot/logs/login.log 2>&1
 
