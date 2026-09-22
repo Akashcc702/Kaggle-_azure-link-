@@ -1,0 +1,14 @@
+# ============================================================
+# CC AlgoTrading — Logrotate Policy for Azure Intraday Engine
+# /etc/logrotate.d/algo_bot
+# ============================================================
+/home/azureuser/azure_bot/logs/*.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+    create 0644 azureuser azureuser
+}
