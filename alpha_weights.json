@@ -1,164 +1,164 @@
 {
   "version": "3.9-Kaggle-GPU",
-  "calibrated_at": "2026-09-20T17:35:03.785082",
+  "calibrated_at": "2026-09-27T18:35:36.961745",
   "hardware": "CPU-Kaggle",
   "cuda_enabled": false,
   "metrics": {
-    "mean_ic": 0.0886,
-    "ic_ir": 4.95,
+    "mean_ic": 0.0881,
+    "ic_ir": 5.09,
     "optimal_lambda": 5.0,
     "num_factors": 30,
     "num_stocks": 115
   },
   "weights": {
     "Alpha01_Ret1d": {
-      "weight": 1.5487,
-      "ic": 0.1139,
+      "weight": 0.8287,
+      "ic": 0.111,
       "regime": "BULL"
     },
     "Alpha02_Ret5d": {
-      "weight": 1.3005,
-      "ic": 0.093,
+      "weight": 0.8198,
+      "ic": 0.1028,
       "regime": "BEAR"
     },
     "Alpha03_Ret10d": {
-      "weight": 1.2418,
-      "ic": 0.116,
+      "weight": 0.8638,
+      "ic": 0.1182,
       "regime": "BULL"
     },
     "Alpha04_Ret20d": {
-      "weight": 0.9351,
-      "ic": 0.0635,
+      "weight": 1.0873,
+      "ic": 0.0607,
       "regime": "BEAR"
     },
     "Alpha05_MACD": {
-      "weight": 0.7084,
-      "ic": 0.0696,
+      "weight": 1.2006,
+      "ic": 0.1151,
       "regime": "BULL"
     },
     "Alpha06_RSI14": {
-      "weight": 1.2747,
-      "ic": 0.0733,
+      "weight": 1.5969,
+      "ic": 0.0738,
       "regime": "BEAR"
     },
     "Alpha07_StochK": {
-      "weight": 0.8101,
-      "ic": 0.0882,
+      "weight": 1.1896,
+      "ic": 0.0894,
       "regime": "BULL"
     },
     "Alpha08_StochD": {
-      "weight": 1.2543,
-      "ic": 0.0683,
+      "weight": 0.7544,
+      "ic": 0.0821,
       "regime": "BEAR"
     },
     "Alpha09_BollingerUpper": {
-      "weight": 1.5634,
-      "ic": 0.1055,
+      "weight": 1.4968,
+      "ic": 0.0682,
       "regime": "BULL"
     },
     "Alpha10_BollingerLower": {
-      "weight": 1.3878,
-      "ic": 0.0714,
+      "weight": 1.131,
+      "ic": 0.1062,
       "regime": "BEAR"
     },
     "Alpha11_ATR14": {
-      "weight": 1.0584,
-      "ic": 0.0632,
+      "weight": 1.2805,
+      "ic": 0.0925,
       "regime": "BULL"
     },
     "Alpha12_RealizedVol20": {
-      "weight": 1.0217,
-      "ic": 0.093,
+      "weight": 1.3796,
+      "ic": 0.0648,
       "regime": "BEAR"
     },
     "Alpha13_ChaikinVol": {
-      "weight": 1.3799,
-      "ic": 0.1124,
+      "weight": 1.3456,
+      "ic": 0.0676,
       "regime": "BULL"
     },
     "Alpha14_VWAP_Dev": {
-      "weight": 1.2166,
-      "ic": 0.074,
+      "weight": 0.7713,
+      "ic": 0.0964,
       "regime": "BEAR"
     },
     "Alpha15_RVOL": {
-      "weight": 0.7074,
-      "ic": 0.0806,
+      "weight": 0.6521,
+      "ic": 0.0693,
       "regime": "BULL"
     },
     "Alpha16_TurnoverRatio": {
-      "weight": 0.7963,
-      "ic": 0.0892,
+      "weight": 1.3552,
+      "ic": 0.077,
       "regime": "BEAR"
     },
     "Alpha17_RollSpread": {
-      "weight": 0.9638,
-      "ic": 0.061,
+      "weight": 1.5485,
+      "ic": 0.0783,
       "regime": "BULL"
     },
     "Alpha18_OBIPump": {
-      "weight": 1.0076,
-      "ic": 0.0974,
+      "weight": 1.0437,
+      "ic": 0.0961,
       "regime": "BEAR"
     },
     "Alpha19_OBIDump": {
-      "weight": 1.4031,
-      "ic": 0.108,
+      "weight": 1.1444,
+      "ic": 0.0648,
       "regime": "BULL"
     },
     "Alpha20_Zscore5d": {
-      "weight": 1.0096,
-      "ic": 0.1082,
+      "weight": 1.2407,
+      "ic": 0.0705,
       "regime": "BEAR"
     },
     "Alpha21_Zscore20d": {
-      "weight": 1.0372,
-      "ic": 0.1087,
+      "weight": 1.1829,
+      "ic": 0.0908,
       "regime": "BULL"
     },
     "Alpha22_PriceSMA50": {
-      "weight": 0.6901,
-      "ic": 0.0987,
+      "weight": 0.6793,
+      "ic": 0.0744,
       "regime": "BEAR"
     },
     "Alpha23_NiftyBeta": {
-      "weight": 1.283,
-      "ic": 0.1016,
+      "weight": 0.9125,
+      "ic": 0.1177,
       "regime": "BULL"
     },
     "Alpha24_LogTurnoverSize": {
-      "weight": 1.1536,
-      "ic": 0.0826,
+      "weight": 1.5561,
+      "ic": 0.0891,
       "regime": "BEAR"
     },
     "Alpha25_ResidVol": {
-      "weight": 1.469,
-      "ic": 0.1154,
+      "weight": 1.5407,
+      "ic": 0.0966,
       "regime": "BULL"
     },
     "Alpha26_HighLowRange": {
-      "weight": 0.984,
-      "ic": 0.1011,
+      "weight": 1.0869,
+      "ic": 0.1099,
       "regime": "BEAR"
     },
     "Alpha27_VolumePriceTrend": {
-      "weight": 0.7347,
-      "ic": 0.0927,
+      "weight": 0.8755,
+      "ic": 0.0691,
       "regime": "BULL"
     },
     "Alpha28_IntradayEfficiency": {
-      "weight": 0.7288,
-      "ic": 0.0602,
+      "weight": 1.5352,
+      "ic": 0.0997,
       "regime": "BEAR"
     },
     "Alpha29_OvernightGap": {
-      "weight": 1.223,
-      "ic": 0.0726,
+      "weight": 1.1132,
+      "ic": 0.1037,
       "regime": "BULL"
     },
     "Alpha30_LiquidityImbalance": {
-      "weight": 1.1874,
-      "ic": 0.0738,
+      "weight": 0.8381,
+      "ic": 0.0872,
       "regime": "BEAR"
     }
   }
