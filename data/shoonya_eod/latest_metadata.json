@@ -1,6 +1,6 @@
 {
-  "date": "20261015",
-  "created_at": "2026-10-15 15:35:10 IST",
+  "date": "20261016",
+  "created_at": "2026-10-16 15:35:06 IST",
   "source": "Finvasia Shoonya Official API (NorenWClientAPI)",
   "num_stocks": 125,
   "total_rows": 7500,
@@ -13,10 +13,10 @@
     "close",
     "volume"
   ],
-  "file_size_kb": 172.39,
+  "file_size_kb": 174.01,
   "compression": "snappy",
   "format": "Apache Parquet",
-  "md5_hash": "88f24a6e12e80cf50516305e1527b46b",
-  "daily_file": "eod_20261015.parquet",
+  "md5_hash": "85aa58526f41de20bd12843f4ad977d6",
+  "daily_file": "eod_20261016.parquet",
   "latest_file": "latest_shoonya_eod.parquet"
 }
