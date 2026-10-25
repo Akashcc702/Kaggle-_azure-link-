@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-18 17:28:25 IST",
+  "generated_at": "2026-10-25 17:45:48 IST",
   "source": "Kaggle NVIDIA T4 GPU Calibration Pipeline",
   "universe_size": 115,
   "top_longs": [
@@ -22,6 +22,6 @@
     "DELTACORP"
   ],
   "sector_cap": 2,
-  "mean_ic": 0.0905,
+  "mean_ic": 0.0937,
   "status": "ACTIVE"
 }
